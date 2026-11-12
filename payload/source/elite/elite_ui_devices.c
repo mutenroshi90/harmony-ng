@@ -8,6 +8,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* A row's label from text_x, cut to fit before the chevron; in the title font and centred on
+   the row when the theme asks for large labels */
+static void draw_row_label(int text_x, int y, int row_h, const char *label, uint16_t color) {
+    const font_aa_t *f = g_theme.large_labels ? &g_font_title : &g_font_main;
+    int ty = g_theme.large_labels ? y + (row_h - f->ascent) / 2 : y + 9;
+    char fit[RF_NAME_SIZE];
+    fb_fit_text_aa(fit, sizeof(fit), label, f, FB_WIDTH - 8 - text_x - (g_theme.chevrons ? 22 : 8));
+    fb_draw_text_aa(text_x, ty, fit, color, f);
+}
+
 void execute_active_dev_cmd(int filtered_idx) {
     char label[32] = {0};
     uint8_t btn_idx = 0, atype = 1;
@@ -63,9 +73,9 @@ void render_devices_screen(void) {
         }
 
         int text_x = has_btn_icon ? 42 : 16;
-        fb_draw_text_aa(text_x, y + 9, label, is_sel ? RGB_WHITE : RGB_CYAN, &g_font_main);
+        draw_row_label(text_x, y, card_h, label, is_sel ? RGB_WHITE : RGB_CYAN);
 
-        if (is_sel) {
+        if (is_sel && g_theme.chevrons) {
             fb_draw_text_aa(FB_WIDTH - 24, y + 8, ">", RGB_CYAN, &g_font_title);
         }
     }
@@ -213,10 +223,8 @@ void render_device_browser_view(void) {
         }
 
         int text_x = has_icon ? 14 + icon_size + 6 : 16;
-        char fit[RF_NAME_SIZE];
-        fb_fit_text_aa(fit, sizeof(fit), label, &g_font_main, FB_WIDTH - 30 - text_x);
-        fb_draw_text_aa(text_x, y + 9, fit, is_sel ? RGB_WHITE : RGB_CYAN, &g_font_main);
-        if (g_browse_dev < 0) {
+        draw_row_label(text_x, y, card_h, label, is_sel ? RGB_WHITE : RGB_CYAN);
+        if (g_browse_dev < 0 && g_theme.chevrons) {
             fb_draw_text_aa(FB_WIDTH - 24, y + 8, ">", is_sel ? RGB_CYAN : RGB_TEXT_MUTED, &g_font_title);
         }
     }
