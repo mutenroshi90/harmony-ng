@@ -27,11 +27,29 @@ int get_settings_sub_count(void) {
     }
 }
 
+/* Where the cards of a Settings list sit: the category list starts under the status bar, an
+   item list under its heading. Themes with large labels stretch the cards over the screen. */
+void settings_list_geometry(bool categories, int count, int *start_y, int *card_h, int *spacing) {
+    *start_y = categories ? 38 : SETTINGS_LIST_Y;
+    if (categories) {
+        *card_h = 35;
+        *spacing = 4;
+    } else {
+        *card_h = (count >= 7) ? 30 : ((count >= 6) ? 34 : 36);
+        *spacing = (count >= 7) ? 3 : ((count >= 6) ? 4 : 5);
+    }
+    if (g_theme.large_labels && count > 0) {
+        *spacing = 4;
+        int h = (FB_HEIGHT - 6 - *start_y - (count - 1) * *spacing) / count;
+        if (h > *card_h) *card_h = h;
+    }
+}
+
 static void render_settings_categories(void) {
-    int start_y = 38;
-    int card_h = 35;
-    int spacing = 4;
+    int start_y, card_h, spacing;
     int total = 6;
+    settings_list_geometry(true, total, &start_y, &card_h, &spacing);
+    bool large = g_theme.large_labels;
 
     const char *cat_names[6] = {
         tr(STR_CAT_CONFIG),
@@ -67,17 +85,21 @@ static void render_settings_categories(void) {
         fb_fill_round_rect(8, y, FB_WIDTH - 16, card_h, g_theme.corner_radius, bg);
         fb_draw_round_rect(8, y, FB_WIDTH - 16, card_h, g_theme.corner_radius, border);
 
-        bool has_icon = blit_png_file(14, y + 7, 20, 20, cat_icons[i]);
-        int text_x = has_icon ? 40 : 14;
-        fb_draw_text_aa(text_x, y + 3, cat_names[i], is_sel ? RGB_WHITE : RGB_CYAN, &g_font_title);
-        fb_draw_text_aa(text_x, y + 19, cat_descs[i], RGB_TEXT_MUTED, &g_font_main);
+        /* Name and description as one block, centred on the card when it is taller */
+        int icon_s = large ? 24 : 20;
+        int name_y = large ? y + (card_h - 36) / 2 : y + 3;
+        bool has_icon = blit_png_file(14, large ? y + (card_h - icon_s) / 2 : y + 7, icon_s, icon_s, cat_icons[i]);
+        int text_x = has_icon ? 14 + icon_s + 6 : 14;
+        fb_draw_text_aa(text_x, name_y, cat_names[i], is_sel ? RGB_WHITE : RGB_CYAN, &g_font_title);
+        fb_draw_text_aa(text_x, name_y + (large ? 19 : 16), cat_descs[i], RGB_TEXT_MUTED, &g_font_main);
 
+        int mid_y = y + (card_h - 15) / 2;
         bool ota_avail = g_update_ota_available && harmony_version_compare(g_hub_ota_version, HARMONY_REMOTE_VERSION) > 0;
         if (i == 5 && ota_avail) {
-            fb_draw_text_aa(FB_WIDTH - 64, y + 10, "[UPDATE]", RGB_YELLOW, &g_font_main);
+            fb_draw_text_aa(FB_WIDTH - 64, large ? mid_y : y + 10, "[UPDATE]", RGB_YELLOW, &g_font_main);
         } else if (i == 0 && g_update_config_available) {
-            fb_draw_text_aa(FB_WIDTH - 55, y + 10, "[SYNC]", RGB_TEAL, &g_font_main);
-        } else {
+            fb_draw_text_aa(FB_WIDTH - 55, large ? mid_y : y + 10, "[SYNC]", RGB_TEAL, &g_font_main);
+        } else if (g_theme.chevrons) {
             fb_draw_text_aa(FB_WIDTH - 20, y + 9, ">", is_sel ? RGB_TEAL : RGB_TEXT_MUTED, &g_font_title);
         }
     }
@@ -86,9 +108,9 @@ static void render_settings_categories(void) {
 static void render_settings_items(const char *title, int count, const char **labels, const char values[][32], const uint16_t *val_colors, const char **icons, int sel_idx) {
     fb_draw_text_aa(14, SETTINGS_HEADING_Y, title, RGB_CYAN, &g_font_title);
 
-    int start_y = SETTINGS_LIST_Y;
-    int card_h = (count >= 7) ? 30 : ((count >= 6) ? 34 : 36);
-    int spacing = (count >= 7) ? 3 : ((count >= 6) ? 4 : 5);
+    int start_y, card_h, spacing;
+    settings_list_geometry(false, count, &start_y, &card_h, &spacing);
+    bool large = g_theme.large_labels;
 
     for (int i = 0; i < count; i++) {
         int y = start_y + i * (card_h + spacing);
@@ -99,19 +121,33 @@ static void render_settings_items(const char *title, int count, const char **lab
         fb_fill_round_rect(8, y, FB_WIDTH - 16, card_h, g_theme.corner_radius, bg);
         fb_draw_round_rect(8, y, FB_WIDTH - 16, card_h, g_theme.corner_radius, border);
 
+        int text_dy = large ? (card_h - 15) / 2 : (card_h <= 30 ? 6 : (card_h == 34 ? 8 : 9));
+        int icon_s = large ? 24 : 20;
         bool has_icon = false;
         if (icons && icons[i]) {
-            has_icon = blit_png_file(14, y + (card_h <= 30 ? 5 : (card_h == 34 ? 7 : 8)), 20, 20, icons[i]);
+            has_icon = blit_png_file(14, y + (large ? (card_h - icon_s) / 2 : (card_h <= 30 ? 5 : (card_h == 34 ? 7 : 8))), icon_s, icon_s, icons[i]);
         }
-        int text_x = has_icon ? 38 : 14;
+        int text_x = has_icon ? 14 + icon_s + 4 : 14;
         uint16_t text_col = is_sel ? RGB_WHITE : RGB_TEXT_MUTED;
-        fb_draw_text_aa(text_x, y + (card_h <= 30 ? 6 : (card_h == 34 ? 8 : 9)), labels[i], text_col, &g_font_main);
 
-        if (values && values[i][0]) {
-            int vw = fb_text_width_aa(values[i], &g_font_main);
-            uint16_t col = val_colors ? val_colors[i] : RGB_TEAL;
-            fb_draw_text_aa(FB_WIDTH - 18 - vw, y + (card_h <= 30 ? 6 : (card_h == 34 ? 8 : 9)), values[i], col, &g_font_main);
+        bool has_value = values && values[i][0];
+        uint16_t val_col = val_colors ? val_colors[i] : RGB_TEAL;
+        if (large) {
+            /* Like the categories: the label in the title font, the value under it */
+            char fit[64];
+            int block_h = has_value ? 36 : g_font_title.ascent;
+            int ly = y + (card_h - block_h) / 2;
+            fb_fit_text_aa(fit, sizeof(fit), labels[i], &g_font_title, FB_WIDTH - 16 - text_x);
+            fb_draw_text_aa(text_x, ly, fit, text_col, &g_font_title);
+            if (has_value) fb_draw_text_aa(text_x, ly + 19, values[i], val_col, &g_font_main);
+            continue;
         }
+
+        if (has_value) {
+            int vw = fb_text_width_aa(values[i], &g_font_main);
+            fb_draw_text_aa(FB_WIDTH - 18 - vw, y + text_dy, values[i], val_col, &g_font_main);
+        }
+        fb_draw_text_aa(text_x, y + text_dy, labels[i], text_col, &g_font_main);
     }
 }
 
@@ -306,7 +342,7 @@ static void render_settings_update(void) {
 
         if (i == 0 && ota_avail) {
             fb_draw_text_aa(FB_WIDTH - 55, y + 9, "[READY]", RGB_YELLOW, &g_font_main);
-        } else {
+        } else if (g_theme.chevrons) {
             fb_draw_text_aa(FB_WIDTH - 20, y + 9, ">", is_sel ? RGB_TEAL : RGB_TEXT_MUTED, &g_font_main);
         }
     }
