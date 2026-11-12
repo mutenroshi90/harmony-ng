@@ -16,6 +16,10 @@ void fb_clip_rows(int y0, int y1);
 void fb_clip_reset(void);
 void fb_fill_rect(int x, int y, int w, int h, uint16_t color);
 void fb_draw_rect(int x, int y, int w, int h, uint16_t color);
+/* Rectangles with corners of radius r, smoothed into what is drawn beneath; r 0 draws the
+   plain rectangle */
+void fb_fill_round_rect(int x, int y, int w, int h, int r, uint16_t color);
+void fb_draw_round_rect(int x, int y, int w, int h, int r, uint16_t color);
 void fb_draw_cog(int cx, int cy, uint16_t color);
 void fb_draw_char(int x, int y, char c, uint16_t fg, uint16_t bg, int scale);
 void fb_draw_text(int x, int y, const char *text, uint16_t fg, uint16_t bg, int scale);

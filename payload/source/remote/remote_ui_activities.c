@@ -162,8 +162,10 @@ int home_card_device_at(int y) {
 /* The icon in its well; a placeholder when the image is missing. In the grid the tile's own
    border shows the selection, so the well keeps its idle border. */
 static void draw_activity_icon(int idx, int icon_x, int icon_y, bool is_sel, bool grid) {
-    fb_fill_rect(icon_x - 2, icon_y - 2, 44, 44, is_sel ? g_theme.pal.icon_well_sel : g_theme.pal.icon_well);
-    fb_draw_rect(icon_x - 2, icon_y - 2, 44, 44, is_sel && !grid ? RGB_TEAL : g_theme.pal.icon_well_border);
+    /* The well sits inside the card, so its corners are a little tighter than the card's */
+    int well_r = g_theme.corner_radius > 3 ? g_theme.corner_radius - 3 : g_theme.corner_radius;
+    fb_fill_round_rect(icon_x - 2, icon_y - 2, 44, 44, well_r, is_sel ? g_theme.pal.icon_well_sel : g_theme.pal.icon_well);
+    fb_draw_round_rect(icon_x - 2, icon_y - 2, 44, 44, well_r, is_sel && !grid ? RGB_TEAL : g_theme.pal.icon_well_border);
 
     bool has_icon = false;
     if (g_activities[idx].icon_path[0]) {
@@ -203,12 +205,17 @@ static void render_activity_page(int page_start, int y_off) {
         uint16_t mark = is_confirm_pending ? RGB_YELLOW : (is_active ? RGB_GREEN : (is_sel ? RGB_TEAL : 0));
         uint16_t text_color = (is_sel || is_active || is_confirm_pending) ? RGB_WHITE : RGB_TEXT_MUTED;
 
-        fb_fill_rect(x, y, w, card_h, bg);
-        fb_draw_rect(x, y, w, card_h, border);
+        int radius = g_theme.corner_radius;
+        fb_fill_round_rect(x, y, w, card_h, radius, bg);
+        fb_draw_round_rect(x, y, w, card_h, radius, border);
 
         if (grid) {
-            /* Tile: the state as a bar along the top, the icon, the name, then the state */
-            if (mark) fb_fill_rect(x, y, w, 4, mark);
+            /* Tile: the state as a bar along the top, the icon, the name, then the state.
+               Rounded tiles get the bar inset, so it stays clear of the corners. */
+            if (mark) {
+                if (radius) fb_fill_round_rect(x + radius, y + 2, w - 2 * radius, 3, 1, mark);
+                else fb_fill_rect(x, y, w, 4, mark);
+            }
             draw_activity_icon(idx, x + (w - 40) / 2, y + 10, is_sel, true);
             draw_centered_text(x, w, y + 54, g_activities[idx].name, text_color);
             if (is_confirm_pending) draw_centered_text(x, w, y + 68, tr(STR_CONFIRM_PRESS_OK), RGB_YELLOW);
@@ -216,7 +223,11 @@ static void render_activity_page(int page_start, int y_off) {
             continue;
         }
 
-        if (mark) fb_fill_rect(x, y, 4, card_h, mark);
+        if (mark) {
+            /* Rounded cards get the state as a short bar inside the left edge */
+            if (radius) fb_fill_round_rect(x + 2, y + radius, 3, card_h - 2 * radius, 1, mark);
+            else fb_fill_rect(x, y, 4, card_h, mark);
+        }
         draw_activity_icon(idx, 14, y + 5, is_sel, false);
 
         char name[sizeof(g_activities[0].name)];

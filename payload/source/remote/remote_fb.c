@@ -3,6 +3,8 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
+#include <math.h>
+
 #include "remote_fb.h"
 
 uint16_t g_backbuffer[FB_WIDTH * FB_HEIGHT];
@@ -133,6 +135,92 @@ void fb_draw_rect(int x, int y, int w, int h, uint16_t color) {
     fb_fill_rect(x, y + h - 1, w, 1, color);
     fb_fill_rect(x, y, 1, h, color);
     fb_fill_rect(x + w - 1, y, 1, h, color);
+}
+
+/* Writes color over the pixel at (x, y) with coverage alpha (0..255), blending with what is
+   already drawn there, so a shape's edge fades into a wallpaper or card beneath it */
+static void blend_px(int x, int y, uint16_t color, int alpha) {
+    if (alpha <= 0 || x < 0 || x >= FB_WIDTH || y < g_clip_y0 || y >= g_clip_y1) return;
+    uint16_t *p = &g_backbuffer[y * FB_WIDTH + x];
+    if (alpha >= 255) { *p = color; return; }
+    int br = (*p >> 11) & 0x1F, bg = (*p >> 5) & 0x3F, bb = *p & 0x1F;
+    int fr = (color >> 11) & 0x1F, fg = (color >> 5) & 0x3F, fb = color & 0x1F;
+    int r = (fr * alpha + br * (255 - alpha) + 127) / 255;
+    int g = (fg * alpha + bg * (255 - alpha) + 127) / 255;
+    int b = (fb * alpha + bb * (255 - alpha) + 127) / 255;
+    *p = (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+/* How much of the pixel at (px, py) lies inside a circle of radius rad around (cx, cy),
+   as 0..255; centres are in pixel units, so pixel (px, py) spans px..px+1 */
+static int disc_coverage(int px, int py, float cx, float cy, float rad) {
+    float dx = (float)px + 0.5f - cx, dy = (float)py + 0.5f - cy;
+    float d = sqrtf(dx * dx + dy * dy);
+    float a = rad - d + 0.5f;
+    if (a <= 0.0f) return 0;
+    if (a >= 1.0f) return 255;
+    return (int)(a * 255.0f + 0.5f);
+}
+
+/* Coverage of pixel (i, j) by the rounded rectangle x, y, w, h with corner radius r */
+static int round_rect_coverage(int i, int j, int x, int y, int w, int h, int r) {
+    float cx, cy;
+    if (i < x + r) cx = (float)(x + r);
+    else if (i >= x + w - r) cx = (float)(x + w - r);
+    else return 255;
+    if (j < y + r) cy = (float)(y + r);
+    else if (j >= y + h - r) cy = (float)(y + h - r);
+    else return 255;
+    return disc_coverage(i, j, cx, cy, (float)r);
+}
+
+static int clamp_radius(int w, int h, int r) {
+    if (r < 0) r = 0;
+    if (r > w / 2) r = w / 2;
+    if (r > h / 2) r = h / 2;
+    return r;
+}
+
+void fb_fill_round_rect(int x, int y, int w, int h, int r, uint16_t color) {
+    r = clamp_radius(w, h, r);
+    if (r == 0) { fb_fill_rect(x, y, w, h, color); return; }
+    /* The middle band and the straight parts of the top and bottom rows are solid */
+    fb_fill_rect(x, y + r, w, h - 2 * r, color);
+    fb_fill_rect(x + r, y, w - 2 * r, r, color);
+    fb_fill_rect(x + r, y + h - r, w - 2 * r, r, color);
+    for (int j = 0; j < r; j++) {
+        for (int i = 0; i < r; i++) {
+            blend_px(x + i, y + j, color, round_rect_coverage(x + i, y + j, x, y, w, h, r));
+            blend_px(x + w - 1 - i, y + j, color, round_rect_coverage(x + w - 1 - i, y + j, x, y, w, h, r));
+            blend_px(x + i, y + h - 1 - j, color, round_rect_coverage(x + i, y + h - 1 - j, x, y, w, h, r));
+            blend_px(x + w - 1 - i, y + h - 1 - j, color, round_rect_coverage(x + w - 1 - i, y + h - 1 - j, x, y, w, h, r));
+        }
+    }
+}
+
+void fb_draw_round_rect(int x, int y, int w, int h, int r, uint16_t color) {
+    r = clamp_radius(w, h, r);
+    if (r == 0) { fb_draw_rect(x, y, w, h, color); return; }
+    /* Straight sides, one pixel wide */
+    fb_fill_rect(x + r, y, w - 2 * r, 1, color);
+    fb_fill_rect(x + r, y + h - 1, w - 2 * r, 1, color);
+    fb_fill_rect(x, y + r, 1, h - 2 * r, color);
+    fb_fill_rect(x + w - 1, y + r, 1, h - 2 * r, color);
+    /* Corners: the ring between the outer edge and one pixel inside it */
+    for (int j = 0; j < r; j++) {
+        for (int i = 0; i < r; i++) {
+            int pts[4][2] = { { x + i, y + j }, { x + w - 1 - i, y + j },
+                              { x + i, y + h - 1 - j }, { x + w - 1 - i, y + h - 1 - j } };
+            for (int k = 0; k < 4; k++) {
+                int px = pts[k][0], py = pts[k][1];
+                float cx = (px < x + r) ? (float)(x + r) : (float)(x + w - r);
+                float cy = (py < y + r) ? (float)(y + r) : (float)(y + h - r);
+                int outer = disc_coverage(px, py, cx, cy, (float)r);
+                int inner = disc_coverage(px, py, cx, cy, (float)r - 1.0f);
+                blend_px(px, py, color, outer - inner);
+            }
+        }
+    }
 }
 
 void fb_draw_cog(int cx, int cy, uint16_t color) {
