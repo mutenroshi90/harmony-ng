@@ -246,7 +246,7 @@ static void render_activity_page(int page_start, int y_off) {
             fb_draw_text_aa(64, y + 28, tr(STR_ACTIVE), RGB_GREEN, &g_font_main);
         }
 
-        if (is_sel) {
+        if (is_sel && g_theme.chevrons) {
             if (!blit_png_file(FB_WIDTH - 24, y + 18, 10, 15, "/opt/luadraws/appscommon/asset/home/chevron.png")) {
                 fb_draw_text_aa(FB_WIDTH - 24, y + 17, ">", RGB_TEAL, &g_font_title);
             }
