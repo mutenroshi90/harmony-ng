@@ -12,13 +12,17 @@ typedef enum { MENU_HELP, MENU_SETTINGS } menu_item_t;
 
 #define MENU_X     4
 #define MENU_Y     36
-#define MENU_W     150
-#define MENU_ROW_H 34
+#define MENU_BASE_W 150
+#define MENU_BASE_ROW_H 34
+/* Larger labels get a wider menu with taller rows */
+#define MENU_W     (g_theme.large_labels ? 200 : MENU_BASE_W)
+#define MENU_ROW_H (g_theme.large_labels ? 46 : MENU_BASE_ROW_H)
+#define MENU_ICON  (g_theme.large_labels ? 28 : 22)
 #define MENU_MAX   4
 
 static int menu_items(menu_item_t *out) {
     int n = 0;
-    if (g_active_activity_id[0] && strcmp(g_active_activity_id, "-1") != 0) out[n++] = MENU_HELP;
+    if (!g_theme.header_help && g_active_activity_id[0] && strcmp(g_active_activity_id, "-1") != 0) out[n++] = MENU_HELP;
     out[n++] = MENU_SETTINGS;
     return n;
 }
@@ -73,11 +77,14 @@ void render_menu(void) {
                 label = tr(STR_SETTINGS);
                 break;
         }
-        if (!blit_png_file(MENU_X + 8, y + 6, 22, 22, icon)) {
-            if (items[i] == MENU_SETTINGS) fb_draw_cog(MENU_X + 19, y + 17, RGB_WHITE);
-            else fb_draw_text_aa(MENU_X + 15, y + 8, "?", RGB_WHITE, &g_font_title);
+        int icon_y = y + (MENU_ROW_H - MENU_ICON) / 2;
+        if (!blit_png_file(MENU_X + 8, icon_y, MENU_ICON, MENU_ICON, icon)) {
+            if (items[i] == MENU_SETTINGS) fb_draw_cog(MENU_X + 8 + MENU_ICON / 2, icon_y + MENU_ICON / 2, RGB_WHITE);
+            else fb_draw_text_aa(MENU_X + 15, icon_y + 2, "?", RGB_WHITE, &g_font_title);
         }
-        fb_draw_text_aa(MENU_X + 38, y + 9, label, sel ? RGB_WHITE : RGB_TEXT_MUTED, &g_font_main);
+        const font_aa_t *f = g_theme.large_labels ? &g_font_title : &g_font_main;
+        int text_y = g_theme.large_labels ? y + (MENU_ROW_H - f->ascent) / 2 : y + 9;
+        fb_draw_text_aa(MENU_X + 16 + MENU_ICON, text_y, label, sel ? RGB_WHITE : RGB_TEXT_MUTED, f);
     }
 }
 

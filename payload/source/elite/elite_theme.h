@@ -60,7 +60,10 @@ typedef struct {
     bool chevrons;             /* ">" on the selected activity, touch button and device row
                                   (theme.json "chevrons", default true) */
     bool large_labels;         /* touch button, device and command rows label in the title
-                                  font, centred (theme.json "large_labels", default false) */
+                                  font, centred, and a larger status bar menu (theme.json
+                                  "large_labels", default false) */
+    bool header_help;          /* help key in the status bar instead of the gear menu while an
+                                  activity runs (theme.json "header_help", default false) */
     uint8_t line_art[3];       /* RGB the dark pixels of stock line art are drawn in: near-white on
                                   dark themes, dark on light ones (theme.json "line_art") */
 } theme_t;

@@ -63,6 +63,13 @@ void header_layout(header_layout_t *l) {
         x -= 6 + l->update_w;
         l->update_x = x;
     }
+    /* The help key, centred in the room between the gear and the indicators */
+    l->help_x = -1;
+    l->help_w = 28;
+    if (g_theme.header_help && g_active_activity_id[0] && strcmp(g_active_activity_id, "-1") != 0 &&
+        x - HDR_GEAR_W >= l->help_w + 8) {
+        l->help_x = HDR_GEAR_W + (x - HDR_GEAR_W - l->help_w) / 2;
+    }
 }
 
 void render_header(void) {
@@ -78,6 +85,10 @@ void render_header(void) {
 
     header_layout_t l;
     header_layout(&l);
+
+    if (l.help_x >= 0 && !blit_png_file(l.help_x + 3, 6, 22, 22, "/opt/luadraws/appscommon/asset/footer/help.png")) {
+        fb_draw_text_aa(l.help_x + 9, 7, "?", RGB_WHITE, &g_font_title);
+    }
 
     if (l.update_x >= 0) {
         bool ota_avail = g_update_ota_available && harmony_version_compare(g_hub_ota_version, HARMONY_ELITE_VERSION) > 0;
