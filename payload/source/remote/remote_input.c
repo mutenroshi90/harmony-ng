@@ -169,6 +169,9 @@ void handle_screen_touch_tap(int x, int y) {
         if (x < HDR_GEAR_W) {
             ui_menu_open();
             render_screen();
+        } else if (l.help_x >= 0 && x >= l.help_x - 4 && x < l.help_x + l.help_w + 4) {
+            ui_help_start();
+            render_screen();
         } else if (x >= l.link_x - 4 && x < l.link_x + l.link_w + 4) {
             g_link_panel_open = true;
             render_screen();

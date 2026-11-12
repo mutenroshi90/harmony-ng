@@ -29,6 +29,7 @@ typedef struct {
     int update_x, update_w;
     int nav_x, nav_w;
     int link_x, link_w;
+    int help_x, help_w;        /* help key, when the theme puts it in the status bar */
     link_quality_t link;
 } header_layout_t;
 
