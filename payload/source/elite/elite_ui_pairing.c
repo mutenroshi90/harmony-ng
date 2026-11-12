@@ -119,7 +119,7 @@ void render_pairing_screen(void) {
 
         fb_draw_text_aa(18, y + 12, opts[i], fg, &g_font_main);
 
-        if (is_sel) {
+        if (is_sel && g_theme.chevrons) {
             fb_draw_text_aa(FB_WIDTH - 28, y + 11, ">", (g_unpair_confirm_active && i == 0 ? RGB_RED : RGB_TEAL), &g_font_title);
         }
     }

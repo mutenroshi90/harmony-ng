@@ -291,7 +291,8 @@ void handle_screen_touch_tap(int x, int y) {
         return;
     } else if (g_current_view == VIEW_SETTINGS) {
         if (g_settings_subview == SETTINGS_VIEW_CATEGORIES) {
-            int card_h = 35, spacing = 4;
+            int start_y, card_h, spacing;
+            settings_list_geometry(true, 6, &start_y, &card_h, &spacing);
             for (int i = 0; i < 6; i++) {
                 int cy = start_y + i * (card_h + spacing);
                 if (y >= cy && y < cy + card_h) {
@@ -325,10 +326,9 @@ void handle_screen_touch_tap(int x, int y) {
                 }
             }
         } else {
-            int start_y = SETTINGS_LIST_Y;
             int count = get_settings_sub_count();
-            int card_h = (count >= 7) ? 30 : ((count >= 6) ? 34 : 36);
-            int spacing = (count >= 7) ? 3 : ((count >= 6) ? 4 : 5);
+            int start_y, card_h, spacing;
+            settings_list_geometry(false, count, &start_y, &card_h, &spacing);
             for (int i = 0; i < count; i++) {
                 int cy = start_y + i * (card_h + spacing);
                 if (y >= cy && y < cy + card_h) {

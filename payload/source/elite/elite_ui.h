@@ -38,6 +38,8 @@ void render_frame(void);
 void render_screen(void);
 void render_header(void);
 void header_layout(header_layout_t *l);
+/* Top, card height and gap of a Settings list (categories or the items of a page) */
+void settings_list_geometry(bool categories, int count, int *start_y, int *card_h, int *spacing);
 void render_key_hint(void);
 void render_link_panel(void);
 bool ui_link_panel_dismiss(void);
