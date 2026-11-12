@@ -219,7 +219,7 @@ static void render_activity_page(int page_start, int y_off) {
             draw_activity_icon(idx, x + (w - 40) / 2, y + 10, is_sel, true);
             draw_centered_text(x, w, y + 54, g_activities[idx].name, text_color);
             if (is_confirm_pending) draw_centered_text(x, w, y + 68, tr(STR_CONFIRM_PRESS_OK), RGB_YELLOW);
-            else if (is_active) draw_centered_text(x, w, y + 68, tr(STR_ACTIVE), RGB_GREEN);
+            else if (is_active && g_theme.active_label) draw_centered_text(x, w, y + 68, tr(STR_ACTIVE), RGB_GREEN);
             continue;
         }
 
@@ -231,11 +231,18 @@ static void render_activity_page(int page_start, int y_off) {
         draw_activity_icon(idx, 14, y + 5, is_sel, false);
 
         char name[sizeof(g_activities[0].name)];
-        fb_draw_text_aa(64, y + 10, fb_fit_text_aa(name, sizeof(name), g_activities[idx].name, &g_font_main, FB_WIDTH - 30 - 64), text_color, &g_font_main);
+        if (!g_theme.active_label && !is_confirm_pending) {
+            /* One line: the name in the title font, centred on the card; the side bar shows
+               whether the activity is running */
+            const font_aa_t *f = &g_font_title;
+            fb_draw_text_aa(64, y + (card_h - f->ascent) / 2, fb_fit_text_aa(name, sizeof(name), g_activities[idx].name, f, FB_WIDTH - 30 - 64), text_color, f);
+        } else {
+            fb_draw_text_aa(64, y + 10, fb_fit_text_aa(name, sizeof(name), g_activities[idx].name, &g_font_main, FB_WIDTH - 30 - 64), text_color, &g_font_main);
+        }
 
         if (is_confirm_pending) {
             fb_draw_text_aa(64, y + 28, tr(STR_CONFIRM_PRESS_OK), RGB_YELLOW, &g_font_main);
-        } else if (is_active) {
+        } else if (is_active && g_theme.active_label) {
             fb_draw_text_aa(64, y + 28, tr(STR_ACTIVE), RGB_GREEN, &g_font_main);
         }
 
