@@ -116,6 +116,7 @@ void theme_load(const char *name) {
     g_theme.pal = CLASSIC_PALETTE;
     g_theme.layout = THEME_LAYOUT_LIST;
     g_theme.corner_radius = 0;
+    g_theme.active_label = true;
     g_theme.wallpaper[0] = '\0';
     g_theme.line_art[0] = 245; g_theme.line_art[1] = 245; g_theme.line_art[2] = 250;
     g_theme.font_main = main_font;
@@ -155,6 +156,8 @@ void theme_load(const char *name) {
     const cJSON *layout = cJSON_GetObjectItem(root, "layout");
     if (cJSON_IsString(layout) && strcmp(layout->valuestring, "grid") == 0) g_theme.layout = THEME_LAYOUT_GRID;
     if (cJSON_IsString(layout) && strcmp(layout->valuestring, "carousel") == 0) g_theme.layout = THEME_LAYOUT_CAROUSEL;
+    const cJSON *active_label = cJSON_GetObjectItem(root, "active_label");
+    if (cJSON_IsBool(active_label)) g_theme.active_label = cJSON_IsTrue(active_label);
     const cJSON *radius = cJSON_GetObjectItem(root, "corner_radius");
     if (cJSON_IsNumber(radius)) {
         int r = radius->valueint;

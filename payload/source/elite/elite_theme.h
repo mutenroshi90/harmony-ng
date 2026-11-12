@@ -54,6 +54,9 @@ typedef struct {
     char wallpaper[96];        /* remote path of the wallpaper; empty: Classic's; "none": pal.bg */
     uint8_t corner_radius;     /* corner radius of cards and icon wells in pixels (theme.json
                                   "corner_radius", 0..16); 0 keeps them square */
+    bool active_label;         /* list cards spell out the running activity under its name
+                                  (theme.json "active_label", default true); without it the
+                                  name is drawn larger and the side bar alone shows the state */
     uint8_t line_art[3];       /* RGB the dark pixels of stock line art are drawn in: near-white on
                                   dark themes, dark on light ones (theme.json "line_art") */
 } theme_t;
