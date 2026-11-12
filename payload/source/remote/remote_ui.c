@@ -71,7 +71,7 @@ void render_header(void) {
     }
 
     uint16_t gear_col = g_menu_open ? RGB_TEAL : RGB_WHITE;
-    if (g_menu_open) fb_fill_rect(2, 3, HDR_GEAR_W - 4, 28, RGB_CARD_SEL);
+    if (g_menu_open) fb_fill_round_rect(2, 3, HDR_GEAR_W - 4, 28, g_theme.corner_radius, RGB_CARD_SEL);
     if (!blit_png_file(6, 6, 22, 22, "/opt/luadraws/appscommon/asset/footer/settings.png")) {
         fb_draw_cog(17, 17, gear_col);
     }
@@ -83,8 +83,8 @@ void render_header(void) {
         bool ota_avail = g_update_ota_available && harmony_version_compare(g_hub_ota_version, HARMONY_REMOTE_VERSION) > 0;
         int nx = l.update_x, ny = HDR_Y;
         uint16_t n_fg = RGB_BLACK;
-        fb_fill_rect(nx, ny, l.update_w, 16, ota_avail ? RGB_YELLOW : RGB_TEAL);
-        fb_draw_rect(nx, ny, l.update_w, 16, RGB_WHITE);
+        fb_fill_round_rect(nx, ny, l.update_w, 16, g_theme.corner_radius, ota_avail ? RGB_YELLOW : RGB_TEAL);
+        fb_draw_round_rect(nx, ny, l.update_w, 16, g_theme.corner_radius, RGB_WHITE);
         fb_fill_rect(nx + 8, ny + 3, 2, 5, n_fg);
         fb_fill_rect(nx + 5, ny + 8, 8, 1, n_fg);
         fb_fill_rect(nx + 6, ny + 9, 6, 1, n_fg);
@@ -96,8 +96,8 @@ void render_header(void) {
     if (l.nav_x >= 0) {
         int cx = l.nav_x + l.nav_w / 2;
         int cy = HDR_Y + 8;
-        fb_fill_rect(l.nav_x, HDR_Y, l.nav_w, 16, RGB_TEAL);
-        fb_draw_rect(l.nav_x, HDR_Y, l.nav_w, 16, RGB_WHITE);
+        fb_fill_round_rect(l.nav_x, HDR_Y, l.nav_w, 16, g_theme.corner_radius, RGB_TEAL);
+        fb_draw_round_rect(l.nav_x, HDR_Y, l.nav_w, 16, g_theme.corner_radius, RGB_WHITE);
         fb_fill_rect(cx - 1, cy - 5, 3, 11, RGB_BLACK);
         fb_fill_rect(cx - 5, cy - 1, 11, 3, RGB_BLACK);
         fb_fill_rect(cx, cy, 1, 1, RGB_TEAL);
@@ -106,8 +106,8 @@ void render_header(void) {
     int x = l.link_x;
     const char *badge = link_badge(&l.link);
     if (badge) {
-        fb_fill_rect(x, HDR_Y, l.link_w, 16, RGB_RED);
-        fb_draw_rect(x, HDR_Y, l.link_w, 16, RGB_WHITE);
+        fb_fill_round_rect(x, HDR_Y, l.link_w, 16, g_theme.corner_radius, RGB_RED);
+        fb_draw_round_rect(x, HDR_Y, l.link_w, 16, g_theme.corner_radius, RGB_WHITE);
         fb_draw_text(x + 3, HDR_Y + 4, badge, RGB_WHITE, RGB_RED, 1);
     } else {
         /* Signal bars, like Wi-Fi: one bar is amber */
@@ -311,8 +311,8 @@ void render_frame(void) {
         int box_h = 28;
         int box_x = (FB_WIDTH - box_w) / 2;
         int box_y = FB_HEIGHT - 68;
-        fb_fill_rect(box_x, box_y, box_w, box_h, RGB_CARD);
-        fb_draw_rect(box_x, box_y, box_w, box_h, RGB_TEAL);
+        fb_fill_round_rect(box_x, box_y, box_w, box_h, g_theme.corner_radius, RGB_CARD);
+        fb_draw_round_rect(box_x, box_y, box_w, box_h, g_theme.corner_radius, RGB_TEAL);
         fb_draw_text_aa(box_x + (box_w - nw) / 2, box_y + 7, g_notice_msg, RGB_WHITE, &g_font_main);
     }
 }
