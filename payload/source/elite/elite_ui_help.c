@@ -178,8 +178,8 @@ static void draw_line(int y, const char *text, uint16_t color, const font_aa_t *
 }
 
 static void draw_button(int x, const char *label, bool sel) {
-    fb_fill_rect(x, HELP_BTN_Y, HELP_BTN_W, HELP_BTN_H, sel ? RGB_CARD_SEL : RGB_CARD);
-    if (sel) fb_draw_rect(x, HELP_BTN_Y, HELP_BTN_W, HELP_BTN_H, RGB_TEAL);
+    fb_fill_round_rect(x, HELP_BTN_Y, HELP_BTN_W, HELP_BTN_H, g_theme.corner_radius, sel ? RGB_CARD_SEL : RGB_CARD);
+    if (sel) fb_draw_round_rect(x, HELP_BTN_Y, HELP_BTN_W, HELP_BTN_H, g_theme.corner_radius, RGB_TEAL);
     int tw = fb_text_width_aa(label, &g_font_title);
     fb_draw_text_aa(x + (HELP_BTN_W - tw) / 2, HELP_BTN_Y + 14, label, sel ? RGB_WHITE : RGB_TEXT_MUTED, &g_font_title);
 }

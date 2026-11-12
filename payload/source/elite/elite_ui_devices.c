@@ -53,8 +53,8 @@ void render_devices_screen(void) {
         uint8_t bidx = 0, atype = 1;
         get_active_dev_cmd_item(idx, label, sizeof(label), &bidx, &atype, icon_key, sizeof(icon_key));
 
-        fb_fill_rect(8, y, FB_WIDTH - 16, card_h, bg);
-        fb_draw_rect(8, y, FB_WIDTH - 16, card_h, border);
+        fb_fill_round_rect(8, y, FB_WIDTH - 16, card_h, g_theme.corner_radius, bg);
+        fb_draw_round_rect(8, y, FB_WIDTH - 16, card_h, g_theme.corner_radius, border);
 
         char btn_icon_path[128] = {0};
         bool has_btn_icon = resolve_button_icon(icon_key, label, btn_icon_path, sizeof(btn_icon_path));
@@ -195,8 +195,8 @@ void render_device_browser_view(void) {
         const rf_dev_cmd_t *c = (g_browse_dev >= 0) ? browser_cmd(idx) : NULL;
         const char *label = (g_browse_dev < 0) ? g_rf_devices[idx].name : (c ? c->name : "");
 
-        fb_fill_rect(8, y, FB_WIDTH - 16, card_h, is_sel ? RGB_CARD_SEL : RGB_CARD);
-        fb_draw_rect(8, y, FB_WIDTH - 16, card_h, is_sel ? RGB_TEAL : g_theme.pal.outline);
+        fb_fill_round_rect(8, y, FB_WIDTH - 16, card_h, g_theme.corner_radius, is_sel ? RGB_CARD_SEL : RGB_CARD);
+        fb_draw_round_rect(8, y, FB_WIDTH - 16, card_h, g_theme.corner_radius, is_sel ? RGB_TEAL : g_theme.pal.outline);
 
         /* Device images are 45 px line art, drawn at 28 px; command glyphs stay at 22 px */
         int icon_size = g_browse_dev < 0 ? 28 : 22;

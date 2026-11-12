@@ -64,8 +64,8 @@ static void render_settings_categories(void) {
         uint16_t bg = is_sel ? RGB_CARD_SEL : RGB_CARD;
         uint16_t border = is_sel ? RGB_TEAL : g_theme.pal.outline;
 
-        fb_fill_rect(8, y, FB_WIDTH - 16, card_h, bg);
-        fb_draw_rect(8, y, FB_WIDTH - 16, card_h, border);
+        fb_fill_round_rect(8, y, FB_WIDTH - 16, card_h, g_theme.corner_radius, bg);
+        fb_draw_round_rect(8, y, FB_WIDTH - 16, card_h, g_theme.corner_radius, border);
 
         bool has_icon = blit_png_file(14, y + 7, 20, 20, cat_icons[i]);
         int text_x = has_icon ? 40 : 14;
@@ -96,8 +96,8 @@ static void render_settings_items(const char *title, int count, const char **lab
         uint16_t bg = is_sel ? RGB_CARD_SEL : RGB_CARD;
         uint16_t border = is_sel ? RGB_TEAL : g_theme.pal.outline;
 
-        fb_fill_rect(8, y, FB_WIDTH - 16, card_h, bg);
-        fb_draw_rect(8, y, FB_WIDTH - 16, card_h, border);
+        fb_fill_round_rect(8, y, FB_WIDTH - 16, card_h, g_theme.corner_radius, bg);
+        fb_draw_round_rect(8, y, FB_WIDTH - 16, card_h, g_theme.corner_radius, border);
 
         bool has_icon = false;
         if (icons && icons[i]) {
@@ -154,8 +154,8 @@ static void render_settings_factory_reset(void) {
             text_col = is_sel ? RGB_RED : RGB_YELLOW;
         }
 
-        fb_fill_rect(8, y, FB_WIDTH - 16, btn_h, bg);
-        fb_draw_rect(8, y, FB_WIDTH - 16, btn_h, border);
+        fb_fill_round_rect(8, y, FB_WIDTH - 16, btn_h, g_theme.corner_radius, bg);
+        fb_draw_round_rect(8, y, FB_WIDTH - 16, btn_h, g_theme.corner_radius, border);
         int tw = fb_text_width_aa(btn_labels[g_factory_reset_stage][i], &g_font_title);
         fb_draw_text_aa((FB_WIDTH - tw) / 2, y + 10, btn_labels[g_factory_reset_stage][i], text_col, &g_font_title);
     }
@@ -187,8 +187,8 @@ static void render_settings_reboot(void) {
         uint16_t border = is_sel ? (i == 1 ? RGB_RED : RGB_TEAL) : (i == 1 ? g_theme.pal.danger_dim : g_theme.pal.outline);
         uint16_t text_col = (i == 1) ? (is_sel ? RGB_RED : RGB_YELLOW) : RGB_WHITE;
 
-        fb_fill_rect(8, y, FB_WIDTH - 16, btn_h, bg);
-        fb_draw_rect(8, y, FB_WIDTH - 16, btn_h, border);
+        fb_fill_round_rect(8, y, FB_WIDTH - 16, btn_h, g_theme.corner_radius, bg);
+        fb_draw_round_rect(8, y, FB_WIDTH - 16, btn_h, g_theme.corner_radius, border);
         int tw = fb_text_width_aa(btn_labels[i], &g_font_title);
         fb_draw_text_aa((FB_WIDTH - tw) / 2, y + 10, btn_labels[i], text_col, &g_font_title);
     }
@@ -236,8 +236,8 @@ static void render_settings_suspend(void) {
         uint16_t border = is_sel ? (i == 1 ? RGB_TEAL : RGB_RED) : (i == 1 ? RGB_CARD_BORDER : g_theme.pal.outline);
         uint16_t text_col = (i == 1) ? (is_sel ? RGB_TEAL : RGB_GREEN) : (is_sel ? RGB_WHITE : RGB_TEXT_MUTED);
 
-        fb_fill_rect(8, y, FB_WIDTH - 16, btn_h, bg);
-        fb_draw_rect(8, y, FB_WIDTH - 16, btn_h, border);
+        fb_fill_round_rect(8, y, FB_WIDTH - 16, btn_h, g_theme.corner_radius, bg);
+        fb_draw_round_rect(8, y, FB_WIDTH - 16, btn_h, g_theme.corner_radius, border);
         int tw = fb_text_width_aa(btn_labels[i], &g_font_title);
         fb_draw_text_aa((FB_WIDTH - tw) / 2, y + 10, btn_labels[i], text_col, &g_font_title);
     }
@@ -249,8 +249,8 @@ static void render_settings_update(void) {
     int start_y = SETTINGS_LIST_Y - 4;
     int card_h = 76;
 
-    fb_fill_rect(8, start_y, FB_WIDTH - 16, card_h, RGB_CARD);
-    fb_draw_rect(8, start_y, FB_WIDTH - 16, card_h, RGB_CARD_BORDER);
+    fb_fill_round_rect(8, start_y, FB_WIDTH - 16, card_h, g_theme.corner_radius, RGB_CARD);
+    fb_draw_round_rect(8, start_y, FB_WIDTH - 16, card_h, g_theme.corner_radius, RGB_CARD_BORDER);
 
     char sw_str[48];
     snprintf(sw_str, sizeof(sw_str), "Elite SW: v%s", HARMONY_ELITE_VERSION);
@@ -295,8 +295,8 @@ static void render_settings_update(void) {
         uint16_t bg = is_sel ? RGB_CARD_SEL : RGB_CARD;
         uint16_t border = is_sel ? RGB_TEAL : g_theme.pal.outline;
 
-        fb_fill_rect(8, y, FB_WIDTH - 16, item_h, bg);
-        fb_draw_rect(8, y, FB_WIDTH - 16, item_h, border);
+        fb_fill_round_rect(8, y, FB_WIDTH - 16, item_h, g_theme.corner_radius, bg);
+        fb_draw_round_rect(8, y, FB_WIDTH - 16, item_h, g_theme.corner_radius, border);
 
         bool has_icon = blit_png_file(14, y + 7, 20, 20, icons[i]);
         int tx = has_icon ? 40 : 14;

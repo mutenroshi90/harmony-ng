@@ -39,8 +39,8 @@ void render_pairing_screen(void) {
     int start_y = 42;
     int card_h = 104;
 
-    fb_fill_rect(8, start_y, FB_WIDTH - 16, card_h, RGB_CARD);
-    fb_draw_rect(8, start_y, FB_WIDTH - 16, card_h, RGB_CARD_BORDER);
+    fb_fill_round_rect(8, start_y, FB_WIDTH - 16, card_h, g_theme.corner_radius, RGB_CARD);
+    fb_draw_round_rect(8, start_y, FB_WIDTH - 16, card_h, g_theme.corner_radius, RGB_CARD_BORDER);
 
     fb_draw_text_aa(16, start_y + 8, tr(STR_RF_HARDWARE_LINK), RGB_CYAN, &g_font_title);
 
@@ -114,8 +114,8 @@ void render_pairing_screen(void) {
         uint16_t border = is_sel ? (g_unpair_confirm_active && i == 0 ? RGB_RED : RGB_TEAL) : g_theme.pal.outline;
         uint16_t fg = is_sel ? (g_unpair_confirm_active && i == 0 ? RGB_RED : RGB_WHITE) : RGB_TEXT_MUTED;
 
-        fb_fill_rect(8, y, FB_WIDTH - 16, opt_h, bg);
-        fb_draw_rect(8, y, FB_WIDTH - 16, opt_h, border);
+        fb_fill_round_rect(8, y, FB_WIDTH - 16, opt_h, g_theme.corner_radius, bg);
+        fb_draw_round_rect(8, y, FB_WIDTH - 16, opt_h, g_theme.corner_radius, border);
 
         fb_draw_text_aa(18, y + 12, opts[i], fg, &g_font_main);
 
@@ -131,12 +131,12 @@ void render_not_paired_screen(void) {
     int card_w = FB_WIDTH - 20;
     int card_h = 232;
 
-    fb_fill_rect(card_x, card_y, card_w, card_h, RGB_CARD);
-    fb_draw_rect(card_x, card_y, card_w, card_h, RGB_CARD_BORDER);
+    fb_fill_round_rect(card_x, card_y, card_w, card_h, g_theme.corner_radius, RGB_CARD);
+    fb_draw_round_rect(card_x, card_y, card_w, card_h, g_theme.corner_radius, RGB_CARD_BORDER);
 
     if (!blit_png_file((FB_WIDTH - 48) / 2, card_y + 16, 48, 48, "/opt/luadraws/appscommon/asset/pairing/connectHub.png")) {
-        fb_fill_rect((FB_WIDTH - 40) / 2, card_y + 20, 40, 40, RGB_CARD_SEL);
-        fb_draw_rect((FB_WIDTH - 40) / 2, card_y + 20, 40, 40, RGB_RED);
+        fb_fill_round_rect((FB_WIDTH - 40) / 2, card_y + 20, 40, 40, g_theme.corner_radius, RGB_CARD_SEL);
+        fb_draw_round_rect((FB_WIDTH - 40) / 2, card_y + 20, 40, 40, g_theme.corner_radius, RGB_RED);
     }
 
     int tw = fb_text_width_aa(tr(STR_REMOTE_NOT_PAIRED), &g_font_title);
@@ -156,9 +156,10 @@ void render_not_paired_screen(void) {
     int btn_w = FB_WIDTH - 48;
     int btn_h = 44;
 
-    fb_fill_rect(btn_x, btn_y, btn_w, btn_h, RGB_CARD_SEL);
-    fb_draw_rect(btn_x, btn_y, btn_w, btn_h, RGB_TEAL);
-    fb_fill_rect(btn_x + 4, btn_y + btn_h - 3, btn_w - 8, 2, RGB_TEAL);
+    fb_fill_round_rect(btn_x, btn_y, btn_w, btn_h, g_theme.corner_radius, RGB_CARD_SEL);
+    fb_draw_round_rect(btn_x, btn_y, btn_w, btn_h, g_theme.corner_radius, RGB_TEAL);
+    { int inset = g_theme.corner_radius > 4 ? g_theme.corner_radius : 4;
+      fb_fill_rect(btn_x + inset, btn_y + btn_h - 3, btn_w - 2 * inset, 2, RGB_TEAL); }
 
     int bw = fb_text_width_aa(tr(STR_PAIR_TO_HUB), &g_font_title);
     fb_draw_text_aa((FB_WIDTH - bw) / 2, btn_y + 13, tr(STR_PAIR_TO_HUB), RGB_WHITE, &g_font_title);

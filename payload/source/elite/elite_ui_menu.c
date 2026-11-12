@@ -56,12 +56,12 @@ void render_menu(void) {
     menu_item_t items[MENU_MAX];
     int n = menu_items(items);
     int h = n * MENU_ROW_H + 4;
-    fb_fill_rect(MENU_X, MENU_Y, MENU_W, h, RGB_CARD);
-    fb_draw_rect(MENU_X, MENU_Y, MENU_W, h, RGB_TEAL);
+    fb_fill_round_rect(MENU_X, MENU_Y, MENU_W, h, g_theme.corner_radius, RGB_CARD);
+    fb_draw_round_rect(MENU_X, MENU_Y, MENU_W, h, g_theme.corner_radius, RGB_TEAL);
     for (int i = 0; i < n; i++) {
         int y = MENU_Y + 2 + i * MENU_ROW_H;
         bool sel = (i == g_menu_sel);
-        if (sel) fb_fill_rect(MENU_X + 2, y, MENU_W - 4, MENU_ROW_H, RGB_CARD_SEL);
+        if (sel) fb_fill_round_rect(MENU_X + 2, y, MENU_W - 4, MENU_ROW_H, g_theme.corner_radius > 2 ? g_theme.corner_radius - 2 : g_theme.corner_radius, RGB_CARD_SEL);
         const char *icon = NULL, *label = "";
         switch (items[i]) {
             case MENU_HELP:
