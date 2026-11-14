@@ -529,6 +529,7 @@ void save_rf_config(void) {
         cJSON_AddStringToObject(b, "ctx", g_rf_buttons[i].context_id);
         cJSON_AddStringToObject(b, "label", g_rf_buttons[i].label);
         cJSON_AddNumberToObject(b, "ctype", g_rf_buttons[i].context_type);
+        if (g_rf_buttons[i].wide) cJSON_AddNumberToObject(b, "wide", 1);
         cJSON_AddNumberToObject(b, "atype", g_rf_buttons[i].action_type);
         cJSON_AddNumberToObject(b, "bidx", g_rf_buttons[i].btn_index);
         if (g_rf_buttons[i].icon_key[0]) {
@@ -698,6 +699,8 @@ void load_rf_config(void) {
                 strncpy(g_rf_buttons[g_rf_button_count].label, jlbl->valuestring, 15);
                 g_rf_buttons[g_rf_button_count].label[15] = '\0';
                 g_rf_buttons[g_rf_button_count].context_type = jctype ? (uint8_t)jctype->valueint : 0;
+                cJSON *jwide = cJSON_GetObjectItem(b, "wide");
+                g_rf_buttons[g_rf_button_count].wide = (jwide && cJSON_IsNumber(jwide) && jwide->valueint) ? 1 : 0;
                 g_rf_buttons[g_rf_button_count].action_type = jatype ? (uint8_t)jatype->valueint : 1;
                 cJSON *jbidx = cJSON_GetObjectItem(b, "bidx");
                 if (jbidx && cJSON_IsNumber(jbidx)) {

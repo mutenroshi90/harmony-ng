@@ -37,6 +37,8 @@ export default {
     "screen_layout_label": "Layout",
     "screen_layout_list": "List",
     "screen_layout_grid": "Grid (2 columns)",
+    "screen_btn_wide": "Whole row (click for half)",
+    "screen_btn_half": "Half a row (click for whole row)",
     "add_switched": "+ Add Switched",
     "admin_account_title": "Admin Account (Full Access)",
     "admin_password": "Admin Password",

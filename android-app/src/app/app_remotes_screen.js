@@ -55,7 +55,7 @@ import {
 import { HarmonyAppRemotesB25 } from './app_remotes_b25.js';
 
 // Names the build of the screen renderer in public/assets; change it whenever that build changes
-const REMOTE_PREVIEW_BUILD = "2.4.0-round-grid3";
+const REMOTE_PREVIEW_BUILD = "2.4.0-round-grid4";
 
 export class HarmonyAppRemotesScreen extends HarmonyAppRemotesB25 {
   async loadRemoteView() {
@@ -694,7 +694,7 @@ export class HarmonyAppRemotesScreen extends HarmonyAppRemotesB25 {
         preview.innerHTML = sbtns.slice(0, isGrid ? 12 : 6).map((b, idx) => {
           const text = b.label || 'Btn ' + (idx + 1);
           return `
-            <div class="remote-screen-tile" title="${escapeHtml(text)}" style="display:flex;align-items:center;justify-content:center;gap:4px;overflow:hidden;padding:0 3px;">
+            <div class="remote-screen-tile" title="${escapeHtml(text)}" style="${isGrid && b.wide ? "grid-column:1 / -1;" : ""}display:flex;align-items:center;justify-content:center;gap:4px;overflow:hidden;padding:0 3px;">
               ${getScreenBtnIconSvg(b.icon, b.label, 11)}
               <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(text)}</span>
             </div>
@@ -744,6 +744,7 @@ export class HarmonyAppRemotesScreen extends HarmonyAppRemotesB25 {
           <select class="form-control screen-btn-cmd" style="font-size: 12px; padding: 4px 6px;">
             ${cmdOpts}
           </select>
+          ${isGrid ? `<button type="button" class="btn btn-xs btn-secondary screen-btn-wide" title="${btn.wide ? t("screen_btn_wide") : t("screen_btn_half")}" style="font-size: 13px; padding: 2px 8px; min-width: 34px;">${btn.wide ? "↔" : "½"}</button>` : ""}
           <button type="button" class="btn btn-xs btn-ghost screen-btn-del" title="Remove" style="color: var(--danger); font-size: 14px; padding: 2px 6px;">✕</button>
         </div>
       `;
@@ -757,6 +758,7 @@ export class HarmonyAppRemotesScreen extends HarmonyAppRemotesB25 {
       const devSel = row.querySelector('.screen-btn-dev');
       const cmdSel = row.querySelector('.screen-btn-cmd');
       const delBtn = row.querySelector('.screen-btn-del');
+      const wideBtn = row.querySelector('.screen-btn-wide');
       const upBtn = row.querySelector('.screen-btn-up');
       const downBtn = row.querySelector('.screen-btn-down');
 
@@ -819,6 +821,13 @@ export class HarmonyAppRemotesScreen extends HarmonyAppRemotesB25 {
 
       delBtn?.addEventListener('click', () => {
         sbtns.splice(idx, 1);
+        this.renderRemoteScreenButtons();
+      });
+
+      // Two-column view: half a row, or the whole row for this button
+      wideBtn?.addEventListener('click', () => {
+        if (sbtns[idx].wide) delete sbtns[idx].wide;
+        else sbtns[idx].wide = true;
         this.renderRemoteScreenButtons();
       });
     });

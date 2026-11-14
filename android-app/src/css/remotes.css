@@ -729,3 +729,6 @@ select {
   color: #ffffff;
 }
 
+.screen-btn-row .screen-btn-wide {
+  flex-shrink: 0;
+}

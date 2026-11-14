@@ -17,6 +17,10 @@
    in two columns. Remotes that do not know it ignore byte 1. */
 #define RF_ACT_COUNT_MASK          0x7F
 #define RF_ACT_FLAG_SCREEN_GRID    0x80
+/* Button chunk byte 2 (the context type, 0x00 hard key or 0x01 on-screen button): bit 7 asks for
+   the on-screen button across the whole row in the two-column view */
+#define RF_BTN_TYPE_MASK           0x7F
+#define RF_BTN_FLAG_WIDE           0x80
 #define RF_MSG_DEVICE_LIST_CHUNK   0x0C  /* One device entry (ACK'd) */
 #define RF_MSG_BUTTON_LIST_CHUNK   0x0D  /* One button entry (ACK'd) */
 #define RF_BUTTON_LIST_MAX         255   /* button entries per push: the entry index is one byte */

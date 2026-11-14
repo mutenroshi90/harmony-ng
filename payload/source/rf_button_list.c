@@ -1,4 +1,5 @@
 #include "rf_button_list.h"
+#include "rf_proto.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -67,7 +68,10 @@ int rf_build_button_list(const cJSON *acts_map, rf_button_entry_t *out, int max)
                 if (!cJSON_IsObject(b)) continue;
                 if (n >= max) break;
                 const cJSON *jl = cJSON_GetObjectItemCaseSensitive(b, "label");
-                put(&out[n++], ctx, cJSON_IsString(jl) ? jl->valuestring : "Button", 0x01, 0x01, sidx++);
+                /* "wide": true spans the whole row in the two-column view */
+                const cJSON *jw = cJSON_GetObjectItemCaseSensitive(b, "wide");
+                uint8_t ctype = (uint8_t)(0x01 | (cJSON_IsTrue(jw) ? RF_BTN_FLAG_WIDE : 0));
+                put(&out[n++], ctx, cJSON_IsString(jl) ? jl->valuestring : "Button", ctype, 0x01, sidx++);
             }
         }
     }

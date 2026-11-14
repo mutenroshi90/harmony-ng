@@ -37,6 +37,8 @@ export default {
     "screen_layout_label": "Ansicht",
     "screen_layout_list": "Liste",
     "screen_layout_grid": "Raster (2 Spalten)",
+    "screen_btn_wide": "Ganze Reihe (Klick: halbe Breite)",
+    "screen_btn_half": "Halbe Reihe (Klick: ganze Reihe)",
     "add_switched": "+ Gewechselt hinzufügen",
     "admin_account_title": "Admin-Konto (Vollzugriff)",
     "admin_password": "Admin-Passwort",

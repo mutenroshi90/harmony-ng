@@ -73,6 +73,8 @@ void render_devices_screen(void);
 #define DEV_GRID_GAP 6
 bool devices_screen_grid(void);
 int devices_grid_index_at(int x, int y);
+/* Rows of the two-column view (wide buttons fill one), and the selected button's row */
+int devices_grid_rows(int *sel_row);
 bool render_activity_hero(void);
 const rf_activity_t *rf_activity_by_id(const char *id);
 /* An activity's large icon, name, state line and devices, x pixels from the left, with its

@@ -37,6 +37,8 @@ export default {
     "screen_layout_label": "Affichage",
     "screen_layout_list": "Liste",
     "screen_layout_grid": "Grille (2 colonnes)",
+    "screen_btn_wide": "Ligne entiere (clic : demi-largeur)",
+    "screen_btn_half": "Demi-ligne (clic : ligne entiere)",
     "add_switched": "+ Ajouter basculé",
     "admin_account_title": "Compte administrateur (Accès complet)",
     "admin_password": "Mot de passe administrateur",

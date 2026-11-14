@@ -231,9 +231,12 @@ static struct {
 
 bool list_geometry(list_geom_t *g) {
     if (g_current_view == VIEW_DEVICES) {
-        /* In two columns a row holds two buttons */
+        /* In two columns a row holds two narrow buttons or a wide one */
         int n = get_active_dev_cmd_count();
-        if (devices_screen_grid()) *g = (list_geom_t){ 1, UI_CONTENT_Y, LIST_PAGE_SIZE, (n + 1) / 2, g_selected_device_cmd / 2 };
+        if (devices_screen_grid()) {
+            int sel_row = 0, rows = devices_grid_rows(&sel_row);
+            *g = (list_geom_t){ 1, UI_CONTENT_Y, LIST_PAGE_SIZE, rows, sel_row };
+        }
         else *g = (list_geom_t){ 1, UI_CONTENT_Y, LIST_PAGE_SIZE, n, g_selected_device_cmd };
     } else if (g_current_view == VIEW_DEVICE_BROWSER) {
         *g = (list_geom_t){ 2 + g_browse_dev, browser_list_y(), browser_page_size(), browser_item_count(), g_browse_sel };

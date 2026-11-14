@@ -37,6 +37,8 @@ export default {
     "screen_layout_label": "Vista",
     "screen_layout_list": "Lista",
     "screen_layout_grid": "Cuadrícula (2 columnas)",
+    "screen_btn_wide": "Fila completa (clic: media fila)",
+    "screen_btn_half": "Media fila (clic: fila completa)",
     "add_switched": "+ Añadir cambiado",
     "admin_account_title": "Cuenta de administrador (Acceso completo)",
     "admin_password": "Contraseña de administrador",

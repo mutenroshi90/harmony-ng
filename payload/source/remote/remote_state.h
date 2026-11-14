@@ -154,6 +154,7 @@ typedef struct {
     char context_id[13];  /* activity context ID, e.g. "53591842" or "-1" */
     char label[16];       /* short button label */
     uint8_t context_type; /* 0=physical, 1=screen/dev button */
+    uint8_t wide;         /* on-screen button across the whole row in two columns (RF_BTN_FLAG_WIDE) */
     uint8_t action_type;  /* 1=device_cmd, 2=activity_start, 3=activity_stop */
     uint8_t btn_index;    /* index in activity screen_buttons */
     char icon_key[24];    /* optional icon key / function id / semantic name */
@@ -392,6 +393,8 @@ void log_remote_debug(const char *fmt, ...);
 bool has_configured_activities(void);
 int get_active_dev_cmd_count(void);
 int get_active_dev_cmd_item(int filtered_idx, char *out_label, size_t label_len, uint8_t *out_btn_index, uint8_t *out_atype, char *out_icon, size_t icon_len);
+/* Whether the running activity's touch button at filtered_idx spans the row in two columns */
+bool get_active_dev_cmd_wide(int filtered_idx);
 
 #ifdef __cplusplus
 }

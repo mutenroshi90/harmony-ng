@@ -15,7 +15,7 @@ extern "C" {
 typedef struct {
     char ctx[12];        /* activity of an on-screen button ("-1" = idle), or a trigger's target */
     char label[16];
-    uint8_t ctype;       /* 0x01 on-screen button, 0x00 hard key */
+    uint8_t ctype;       /* 0x01 on-screen button (| RF_BTN_FLAG_WIDE), 0x00 hard key */
     uint8_t atype;       /* 0x01 device command, 0x02 activity start, 0x03 activity stop */
     uint8_t idx;         /* position in the activity's on-screen list or hard-key map */
 } rf_button_entry_t;

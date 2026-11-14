@@ -339,7 +339,8 @@ void handle_hub_frame_remote(const rf_frame_t *f) {
             sync_touch_chunk();
             uint8_t idx = f->payload[0];
             if (idx < MAX_RF_BUTTONS) {
-                g_rf_buttons[idx].context_type = f->payload[2];
+                g_rf_buttons[idx].context_type = f->payload[2] & RF_BTN_TYPE_MASK;
+                g_rf_buttons[idx].wide = (f->payload[2] & RF_BTN_FLAG_WIDE) ? 1 : 0;
                 memcpy(g_rf_buttons[idx].context_id, &f->payload[3], 9);
                 g_rf_buttons[idx].context_id[9] = '\0';
                 memcpy(g_rf_buttons[idx].label, &f->payload[12], 12);
@@ -351,7 +352,7 @@ void handle_hub_frame_remote(const rf_frame_t *f) {
                 if (idx >= g_rf_button_count) g_rf_button_count = idx + 1;
 
                 /* Check if this button is mapped to an activity start or stop */
-                if (f->payload[2] == 0x00 && (f->payload[24] == 0x02 || f->payload[24] == 0x03)) {
+                if (g_rf_buttons[idx].context_type == 0x00 && (f->payload[24] == 0x02 || f->payload[24] == 0x03)) {
                     if (g_act_trigger_count < MAX_ACT_TRIGGERS) {
                         strncpy(g_act_triggers[g_act_trigger_count].button_name, g_rf_buttons[idx].label, sizeof(g_act_triggers[0].button_name) - 1);
                         g_act_triggers[g_act_trigger_count].atype = f->payload[24];

@@ -37,6 +37,8 @@ export default {
     "screen_layout_label": "Weergave",
     "screen_layout_list": "Lijst",
     "screen_layout_grid": "Raster (2 kolommen)",
+    "screen_btn_wide": "Hele rij (klik: halve rij)",
+    "screen_btn_half": "Halve rij (klik: hele rij)",
     "add_switched": "+ Gewisseld toevoegen",
     "admin_account_title": "Beheerdersaccount (Volledige toegang)",
     "admin_password": "Beheerderswachtwoord",

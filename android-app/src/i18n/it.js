@@ -37,6 +37,8 @@ export default {
     "screen_layout_label": "Vista",
     "screen_layout_list": "Elenco",
     "screen_layout_grid": "Griglia (2 colonne)",
+    "screen_btn_wide": "Riga intera (clic: mezza riga)",
+    "screen_btn_half": "Mezza riga (clic: riga intera)",
     "add_switched": "+ Aggiungi passato",
     "admin_account_title": "Account amministratore (Accesso completo)",
     "admin_password": "Password amministratore",

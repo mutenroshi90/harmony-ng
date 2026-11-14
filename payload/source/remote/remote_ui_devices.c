@@ -40,12 +40,45 @@ bool devices_screen_grid(void) {
     return act && act->screen_grid;
 }
 
+/* The rows of the two-column view: a wide button fills a row, two narrow ones in a row share
+   one, and a narrow one before a wide one (or the last one) keeps its half alone. Fills the row
+   and column (0 left, 1 right) of each button and returns the number of rows. */
+static short s_grid_row[MAX_RF_BUTTONS];
+static unsigned char s_grid_col[MAX_RF_BUTTONS], s_grid_wide[MAX_RF_BUTTONS];
+
+static int grid_layout(int total) {
+    if (total > MAX_RF_BUTTONS) total = MAX_RF_BUTTONS;
+    int row = 0, col = 0;
+    for (int i = 0; i < total; i++) {
+        bool wide = get_active_dev_cmd_wide(i);
+        if (wide && col) { row++; col = 0; } /* a wide button starts its own row */
+        s_grid_row[i] = (short)row;
+        s_grid_col[i] = (unsigned char)col;
+        s_grid_wide[i] = wide;
+        if (wide || col) { row++; col = 0; }
+        else col = 1;
+    }
+    return total ? row + (col ? 1 : 0) : 0;
+}
+
+int devices_grid_rows(int *sel_row) {
+    int total = get_active_dev_cmd_count();
+    int rows = grid_layout(total);
+    if (sel_row) *sel_row = (g_selected_device_cmd >= 0 && g_selected_device_cmd < total && g_selected_device_cmd < MAX_RF_BUTTONS)
+                                ? s_grid_row[g_selected_device_cmd] : 0;
+    return rows;
+}
+
 /* The button under a tap in the two-column view: the row from the list, the column from x */
 int devices_grid_index_at(int x, int y) {
     int row = list_row_at(y);
     if (row < 0) return -1;
-    int idx = row * 2 + (x >= FB_WIDTH / 2 ? 1 : 0);
-    return idx < get_active_dev_cmd_count() ? idx : -1;
+    int total = grid_layout(get_active_dev_cmd_count());
+    int col = x >= FB_WIDTH / 2 ? 1 : 0;
+    for (int i = 0; i < total && i < MAX_RF_BUTTONS; i++) {
+        if (s_grid_row[i] == row && (s_grid_wide[i] || s_grid_col[i] == col)) return i;
+    }
+    return -1;
 }
 
 void render_devices_screen(void) {
@@ -68,12 +101,15 @@ void render_devices_screen(void) {
     fb_clip_rows(g.y, g.y + g.rows * LIST_ROW_PITCH);
 
     if (devices_screen_grid()) {
-        /* Two columns: a list row holds two buttons, the label centred in each */
-        int col_w = (FB_WIDTH - 16 - DEV_GRID_GAP) / 2;
-        for (int idx = first * 2; idx < total; idx++) {
-            int y = start_y + (idx / 2) * LIST_ROW_PITCH - scroll;
+        /* Two columns: a row holds two narrow buttons or one wide one, the label centred */
+        int half_w = (FB_WIDTH - 16 - DEV_GRID_GAP) / 2;
+        int n = grid_layout(total) ? (total < MAX_RF_BUTTONS ? total : MAX_RF_BUTTONS) : 0;
+        for (int idx = 0; idx < n; idx++) {
+            if (s_grid_row[idx] < first) continue;
+            int y = start_y + s_grid_row[idx] * LIST_ROW_PITCH - scroll;
             if (y >= g.y + g.rows * LIST_ROW_PITCH) break;
-            int x = 8 + (idx % 2) * (col_w + DEV_GRID_GAP);
+            int col_w = s_grid_wide[idx] ? FB_WIDTH - 16 : half_w;
+            int x = 8 + s_grid_col[idx] * (half_w + DEV_GRID_GAP);
             bool is_sel = (idx == g_selected_device_cmd);
 
             char label[32] = {0};
