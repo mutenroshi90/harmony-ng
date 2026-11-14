@@ -853,25 +853,28 @@ export class HarmonyAppRemotesScreen extends HarmonyAppRemotesB25 {
 
     // The theme the preview draws with: the Hub does not know which one the remote uses, so the
     // page offers the themes this build ships and remembers the choice in the browser
-    const themeSel = document.getElementById('remoteScreenThemeSelect');
+    const themeBar = document.getElementById('remoteScreenThemeBar');
     let theme = 'classic';
     try { theme = localStorage.getItem('remotePreviewTheme') || 'classic'; } catch { /* no storage */ }
-    if (themeSel && !themeSel.dataset.bound) {
-      themeSel.dataset.bound = '1';
+    if (themeBar && !themeBar.dataset.bound) {
+      themeBar.dataset.bound = '1';
       const list = await preview.themeList();
       if (!list.some((th) => th.id === 'classic')) list.unshift({ id: 'classic', name: 'Classic' });
-      themeSel.innerHTML = list.map((th) => `<option value="${escapeHtml(th.id)}">${escapeHtml(th.name)}</option>`).join('');
-      themeSel.style.display = list.length > 1 ? '' : 'none';
-      themeSel.addEventListener('change', () => {
-        try { localStorage.setItem('remotePreviewTheme', themeSel.value); } catch { /* no storage */ }
+      themeBar.innerHTML = list.map((th) =>
+        `<button type="button" class="segmented-btn" data-theme="${escapeHtml(th.id)}">${escapeHtml(th.name)}</button>`).join('');
+      themeBar.style.display = list.length > 1 ? 'flex' : 'none';
+      themeBar.addEventListener('click', (e) => {
+        const id = e.target.closest('[data-theme]')?.dataset.theme;
+        if (!id) return;
+        try { localStorage.setItem('remotePreviewTheme', id); } catch { /* no storage */ }
         this.updateRemoteScreenCanvas();
       });
     }
-    if (themeSel) {
-      if (![...themeSel.options].some((o) => o.value === theme)) theme = 'classic';
-      themeSel.value = theme;
+    if (themeBar) {
+      if (!themeBar.querySelector(`[data-theme="${CSS.escape(theme)}"]`)) theme = 'classic';
     }
     if (!(await preview.loadTheme(module, theme))) theme = 'classic';
+    themeBar?.querySelectorAll('[data-theme]').forEach((b) => b.classList.toggle('active', b.dataset.theme === theme));
 
     const isDevScope = this.remoteContextMode === 'device';
     const actId = this.remoteSelectedActivityId || document.getElementById('remoteActivitySelect')?.value || '-1';
