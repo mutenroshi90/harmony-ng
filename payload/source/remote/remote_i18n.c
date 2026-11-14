@@ -178,6 +178,10 @@ static const char * const g_remote_strings[STR_COUNT][REMOTE_LANG_COUNT] = {
     { "Touch Sensitivity", "Touch-Empfindlichkeit", "Sensibilite tactile", "Aanraakgevoeligheid", "Sensibilidad tactil", "Sensibilita tocco" },
     /* STR_PHYSICAL_NAV */
     { "Physical Button Nav", "Physische Tasten-Nav", "Nav par touches", "Fysieke knoppennav.", "Nav botones fisicos", "Nav tasti fisici" },
+    /* STR_DPAD_HOME */
+    { "D-Pad on Home", "Steuerkreuz Startseite", "Croix sur accueil", "D-pad op startscherm", "Cruceta en inicio", "Croce su home" },
+    /* STR_WAKE_ACTIVITY */
+    { "Wake to Activity", "Aufwachen in Aktion", "Reveil sur activite", "Wekken naar activiteit", "Despertar en actividad", "Risveglio su attivita" },
 
     /* STR_TILT_WAKE */
     { "Tilt / Pickup Wake", "Beim Anheben wecken", "Reveil au mouvement", "Ontwaken bij optillen", "Encender al mover", "Risveglio al movimento" },

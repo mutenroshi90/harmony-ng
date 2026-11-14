@@ -52,6 +52,24 @@ void trigger_activity_switch_external(const char *id, const char *name) {
     g_screen_dirty = true;
 }
 
+/* "Wake to Activity": the screen coming back on shows the running activity, or home when none
+   runs. Pairing, Help and transfers keep their screen. */
+void ui_wake_to_activity(void) {
+    if (!g_wake_to_activity || !is_remote_paired() || ui_help_active()) return;
+    if (g_current_view == VIEW_PAIRING || g_current_view == VIEW_NOT_PAIRED) return;
+    if (g_is_switching_activity || g_is_syncing_config || g_is_ota_updating) return;
+    ui_menu_close();
+    if (g_active_activity_id[0] && strcmp(g_active_activity_id, "-1") != 0 &&
+        rf_activity_by_id(g_active_activity_id)) {
+        if (g_current_view != VIEW_DEVICES) g_selected_device_cmd = 0;
+        g_current_view = VIEW_DEVICES;
+    } else if (has_configured_activities()) {
+        g_current_view = VIEW_ACTIVITIES;
+        home_select_running();
+    }
+    g_screen_dirty = true;
+}
+
 void request_activity_switch_with_confirm(int act_idx) {
     if (act_idx < 0 || act_idx >= g_activity_count) return;
     activity_item_t *sel = &g_activities[act_idx];

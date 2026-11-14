@@ -15,6 +15,8 @@ int find_touchscreen_fd(void);
 void handle_screen_touch_tap(int x, int y);
 uint16_t linux_to_harmony_rf_key(int code);
 void handle_navigation_key(int code, int value);
+/* The D-pad and OK on the home screen when the remote is set to "D-Pad on Home"; true when used */
+bool handle_home_dpad_key(int code, int value);
 void *key_repeat_thread(void *arg);
 
 #ifdef __cplusplus

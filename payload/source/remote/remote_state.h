@@ -275,6 +275,8 @@ extern uint64_t g_suspend_countdown_start_ms;
 extern int g_selected_pair_opt;
 extern bool g_touch_enabled;
 extern bool g_physical_nav_enabled;
+extern bool g_dpad_home;        /* D-pad and OK drive the home screen while it shows */
+extern bool g_wake_to_activity; /* waking from idle opens the running activity */
 extern bool g_cap_buttons_enabled;
 extern int g_touch_sensitivity;
 extern uint64_t g_last_switch_completed_ms;

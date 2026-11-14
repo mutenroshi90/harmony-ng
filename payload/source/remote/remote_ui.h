@@ -56,6 +56,8 @@ int home_layout(void);
 const char *home_layout_name(void);
 /* Shows the running activity's page in the carousel */
 void home_select_running(void);
+/* Waking from idle: opens the running activity when the remote is set to "Wake to Activity" */
+void ui_wake_to_activity(void);
 int activity_page_size(void);
 void activity_slot_rect(int slot, int *x, int *y, int *w, int *h);
 /* The activity on the current home page under (x, y), or -1 */

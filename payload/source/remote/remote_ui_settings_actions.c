@@ -205,6 +205,14 @@ void execute_settings_action(int idx) {
                 }
                 save_settings_conf();
                 break;
+            case 4:
+                g_dpad_home = !g_dpad_home;
+                save_settings_conf();
+                break;
+            case 5:
+                g_wake_to_activity = !g_wake_to_activity;
+                save_settings_conf();
+                break;
             default: break;
         }
         return;

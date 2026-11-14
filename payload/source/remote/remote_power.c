@@ -655,6 +655,7 @@ void *power_manager(void *arg) {
 void reset_idle_timer(void) {
     g_last_activity_time = time(NULL);
     if (!g_screen_on) {
+        ui_wake_to_activity();
         fb_set_blank(false);
         rf_wake_and_reconnect();
         render_screen();

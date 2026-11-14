@@ -891,6 +891,8 @@ void load_settings_conf(void) {
             int val = atoi(sval);
             if (strcmp(key, "touch") == 0) g_touch_enabled = (val != 0);
             else if (strcmp(key, "physical_nav") == 0 || strcmp(key, "screen_nav_mode") == 0) g_physical_nav_enabled = (val != 0);
+            else if (strcmp(key, "dpad_home") == 0) g_dpad_home = (val != 0);
+            else if (strcmp(key, "wake_activity") == 0) g_wake_to_activity = (val != 0);
             else if (strcmp(key, "cap_buttons") == 0 || strcmp(key, "capacitive_buttons") == 0) g_cap_buttons_enabled = (val != 0);
             else if (strcmp(key, "touch_sens") == 0) g_touch_sensitivity = (val >= 1 && val <= 3) ? val : 2;
             else if (strcmp(key, "gyro") == 0) g_gyro_enabled = (val != 0);
@@ -945,6 +947,8 @@ void save_settings_conf(void) {
     int n = snprintf(buf, sizeof(buf),
         "touch=%d\n"
         "physical_nav=%d\n"
+        "dpad_home=%d\n"
+        "wake_activity=%d\n"
         "cap_buttons=%d\n"
         "touch_sens=%d\n"
         "gyro=%d\n"
@@ -970,6 +974,8 @@ void save_settings_conf(void) {
         "tz=%s\n",
         g_touch_enabled ? 1 : 0,
         g_physical_nav_enabled ? 1 : 0,
+        g_dpad_home ? 1 : 0,
+        g_wake_to_activity ? 1 : 0,
         g_cap_buttons_enabled ? 1 : 0,
         g_touch_sensitivity,
         g_gyro_enabled ? 1 : 0,

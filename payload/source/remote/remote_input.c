@@ -360,6 +360,27 @@ void handle_screen_touch_tap(int x, int y) {
     }
 }
 
+/* Set while the D-pad drives the home screen (handle_home_dpad_key), so the navigation keys act
+   with the touchscreen on */
+static bool s_home_dpad = false;
+
+bool handle_home_dpad_key(int code, int value) {
+    if (!g_dpad_home || g_current_view != VIEW_ACTIVITIES || g_menu_open) return false;
+    int nav;
+    switch (code) {
+        case 103: case 105: nav = 78; break;   /* Up, Left: previous activity */
+        case 108: case 106: nav = 74; break;   /* Down, Right: next activity */
+        case 28: case 352: nav = 148; break;   /* OK: start it */
+        default: return false;
+    }
+    /* OK acts on the press only: a held OK must not confirm the switch it asked for */
+    if (nav == 148 && value != 1) return true;
+    s_home_dpad = true;
+    handle_navigation_key(nav, value);
+    s_home_dpad = false;
+    return true;
+}
+
 void handle_navigation_key(int code, int value) {
     if (value == 1) ui_help_close(); /* the Activities and Devices keys leave Help */
     if (code == 364 && value == 0) {
@@ -426,7 +447,7 @@ void handle_navigation_key(int code, int value) {
 
     if (g_is_switching_activity || g_is_syncing_config || g_is_ota_updating) return;
 
-    if (!g_physical_nav_enabled && g_touch_enabled && g_current_view != VIEW_SETTINGS && g_current_view != VIEW_PAIRING) {
+    if (!s_home_dpad && !g_physical_nav_enabled && g_touch_enabled && g_current_view != VIEW_SETTINGS && g_current_view != VIEW_PAIRING) {
         return;
     }
 

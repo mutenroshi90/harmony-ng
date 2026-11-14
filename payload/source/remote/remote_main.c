@@ -687,6 +687,13 @@ int main(int argc, char **argv) {
                     /* Help takes the D-pad, OK and Back; other keys, such as volume, still act */
                     if (!g_menu_open && ui_help_active() && ev.value != 0 && ui_help_handle_key(ev.code)) continue;
 
+                    /* "D-Pad on Home": the D-pad and OK pick and start an activity on the home
+                       screen; OK's release is swallowed, since OK may already have left it */
+                    if (handle_home_dpad_key(ev.code, ev.value)) {
+                        if (ev.value == 1 && (ev.code == 28 || ev.code == 352)) key_set_swallowed(ev.code, true);
+                        continue;
+                    }
+
                     uint16_t rf_code = linux_to_harmony_rf_key(ev.code);
 
                     /* With physical navigation enabled, the bottom keys drive the screen on all views (KEY_BACK passes through to RF) */

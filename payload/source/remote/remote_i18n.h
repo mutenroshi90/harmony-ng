@@ -119,6 +119,8 @@ typedef enum {
     STR_CAP_BUTTONS,
     STR_TOUCH_SENSITIVITY,
     STR_PHYSICAL_NAV,
+    STR_DPAD_HOME,
+    STR_WAKE_ACTIVITY,
 
     /* Settings POWER subview */
     STR_TILT_WAKE,
