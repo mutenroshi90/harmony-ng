@@ -18,6 +18,7 @@ import {
   safeImportName
 } from '../irdb.js';
 import { t, setLanguage, getInitialLanguage } from '../i18n.js';
+
 import iconMetadata from '../icon-metadata.json';
 import {
   initIconCache,
@@ -52,6 +53,9 @@ import {
   getRawDeviceIconSvg
 } from './app_icons_ui.js';
 import { HarmonyAppRemotesB25 } from './app_remotes_b25.js';
+
+// Names the build of the screen renderer in public/assets; change it whenever that build changes
+const REMOTE_PREVIEW_BUILD = "2.4.0-round-grid1";
 
 export class HarmonyAppRemotesScreen extends HarmonyAppRemotesB25 {
   async loadRemoteView() {
@@ -830,7 +834,9 @@ export class HarmonyAppRemotesScreen extends HarmonyAppRemotesB25 {
     let preview;
     let module;
     try {
-      preview = await import(/* @vite-ignore */ new URL('assets/remote_preview.js', document.baseURI).href);
+      // The query names this build of the renderer: the Hub serves assets as immutable, and the
+      // loader passes the query on to the renderer and theme files it fetches
+      preview = await import(/* @vite-ignore */ new URL('assets/remote_preview.js?v=' + REMOTE_PREVIEW_BUILD, document.baseURI).href);
       module = await preview.loadHubRenderer(this.client?.baseUrl);
     } catch (e) {
       return; // no renderer in this build: keep the HTML mock-up
@@ -844,6 +850,28 @@ export class HarmonyAppRemotesScreen extends HarmonyAppRemotesB25 {
         this.updateRemoteScreenCanvas();
       });
     }
+
+    // The theme the preview draws with: the Hub does not know which one the remote uses, so the
+    // page offers the themes this build ships and remembers the choice in the browser
+    const themeSel = document.getElementById('remoteScreenThemeSelect');
+    let theme = 'classic';
+    try { theme = localStorage.getItem('remotePreviewTheme') || 'classic'; } catch { /* no storage */ }
+    if (themeSel && !themeSel.dataset.bound) {
+      themeSel.dataset.bound = '1';
+      const list = await preview.themeList();
+      if (!list.some((th) => th.id === 'classic')) list.unshift({ id: 'classic', name: 'Classic' });
+      themeSel.innerHTML = list.map((th) => `<option value="${escapeHtml(th.id)}">${escapeHtml(th.name)}</option>`).join('');
+      themeSel.style.display = list.length > 1 ? '' : 'none';
+      themeSel.addEventListener('change', () => {
+        try { localStorage.setItem('remotePreviewTheme', themeSel.value); } catch { /* no storage */ }
+        this.updateRemoteScreenCanvas();
+      });
+    }
+    if (themeSel) {
+      if (![...themeSel.options].some((o) => o.value === theme)) theme = 'classic';
+      themeSel.value = theme;
+    }
+    if (!(await preview.loadTheme(module, theme))) theme = 'classic';
 
     const isDevScope = this.remoteContextMode === 'device';
     const actId = this.remoteSelectedActivityId || document.getElementById('remoteActivitySelect')?.value || '-1';
@@ -869,7 +897,7 @@ export class HarmonyAppRemotesScreen extends HarmonyAppRemotesB25 {
     const now = new Date();
     preview.render(module, canvas, {
       view, select, active: actId === '-1' ? '' : preview.remoteActivityId(actId),
-      battery: 100, minutes: now.getHours() * 60 + now.getMinutes(),
+      theme, battery: 100, minutes: now.getHours() * 60 + now.getMinutes(),
     });
 
     canvas.hidden = false;
