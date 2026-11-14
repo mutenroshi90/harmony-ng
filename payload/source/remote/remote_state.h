@@ -131,6 +131,8 @@ typedef struct {
     uint16_t icon_id;
     uint8_t dev_count;            /* devices the activity uses, from RF_MSG_ACT_DEVICES_CHUNK */
     uint8_t devs[MAX_RF_DEVICES]; /* indexes into g_rf_devices */
+    uint8_t screen_grid;          /* touch buttons in two columns (RF_ACT_FLAG_SCREEN_GRID in the
+                                     activity chunk's count byte) */
 } rf_activity_t;
 
 typedef struct {

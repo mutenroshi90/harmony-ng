@@ -251,7 +251,6 @@ void handle_screen_touch_tap(int x, int y) {
 
     if (!is_tap) return;
 
-    int start_y = UI_CONTENT_Y;
     if (g_current_view == VIEW_ACTIVITIES) {
         /* On the running activity's carousel card, a device row opens that device's commands */
         int dev = home_card_device_at(y);
@@ -275,7 +274,7 @@ void handle_screen_touch_tap(int x, int y) {
         }
         return;
     } else if (g_current_view == VIEW_DEVICES) {
-        int row = list_row_at(y);
+        int row = devices_screen_grid() ? devices_grid_index_at(x, y) : list_row_at(y);
         if (row >= 0) {
             g_selected_device_cmd = row;
             execute_active_dev_cmd(row);

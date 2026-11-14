@@ -13,6 +13,10 @@
 /* Hub -> Remote */
 #define RF_MSG_ACTIVITY_SYNC       0x0A  /* Current activity ID + name */
 #define RF_MSG_ACTIVITY_LIST_CHUNK 0x0B  /* One activity entry (ACK'd) */
+/* Activity chunk byte 1 holds the activity count in its low bits; bit 7 asks for the touch buttons
+   in two columns. Remotes that do not know it ignore byte 1. */
+#define RF_ACT_COUNT_MASK          0x7F
+#define RF_ACT_FLAG_SCREEN_GRID    0x80
 #define RF_MSG_DEVICE_LIST_CHUNK   0x0C  /* One device entry (ACK'd) */
 #define RF_MSG_BUTTON_LIST_CHUNK   0x0D  /* One button entry (ACK'd) */
 #define RF_BUTTON_LIST_MAX         255   /* button entries per push: the entry index is one byte */

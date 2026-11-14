@@ -221,6 +221,7 @@ void handle_hub_frame_remote(const rf_frame_t *f) {
                 sanitize_ascii(g_rf_activities[idx].id, sizeof(g_rf_activities[idx].id));
                 sanitize_ascii(g_rf_activities[idx].name, sizeof(g_rf_activities[idx].name));
                 g_rf_activities[idx].icon_id = icon_id;
+                g_rf_activities[idx].screen_grid = (f->payload[1] & RF_ACT_FLAG_SCREEN_GRID) ? 1 : 0;
                 g_rf_activities[idx].dev_count = 0; /* RF_MSG_ACT_DEVICES_CHUNK follows on Hubs that send it */
                 map_icon_type_to_str(itype, g_rf_activities[idx].name, g_rf_activities[idx].icon, sizeof(g_rf_activities[idx].icon));
                 if (idx >= g_rf_activity_count) g_rf_activity_count = idx + 1;

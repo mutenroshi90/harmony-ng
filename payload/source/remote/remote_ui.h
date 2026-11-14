@@ -67,6 +67,10 @@ void render_switching_view(void);
 
 void render_activities_screen(void);
 void render_devices_screen(void);
+/* Touch buttons in two columns for the running activity, and the button under a tap there */
+#define DEV_GRID_GAP 6
+bool devices_screen_grid(void);
+int devices_grid_index_at(int x, int y);
 bool render_activity_hero(void);
 const rf_activity_t *rf_activity_by_id(const char *id);
 /* An activity's large icon, name, state line and devices, x pixels from the left, with its

@@ -655,9 +655,26 @@ export class HarmonyAppRemotesScreen extends HarmonyAppRemotesB25 {
       sbtns = actObj.screen_buttons;
     }
 
+    // List or two-column grid on the remote, stored per activity as "screen_layout"
+    const layoutWrap = document.getElementById('remoteScreenLayoutWrap');
+    const layoutSel = document.getElementById('remoteScreenLayoutSelect');
+    const layoutAct = isDevScope ? null : this.remoteMapData.activities[this.remoteSelectedActivityId || document.getElementById('remoteActivitySelect')?.value || '-1'];
+    if (layoutWrap) layoutWrap.style.display = layoutAct ? 'flex' : 'none';
+    if (layoutSel && layoutAct) {
+      layoutSel.value = layoutAct.screen_layout === 'grid' ? 'grid' : 'list';
+      layoutSel.onchange = () => {
+        if (layoutSel.value === 'grid') layoutAct.screen_layout = 'grid';
+        else delete layoutAct.screen_layout;
+        this.renderRemoteScreenButtons();
+      };
+    }
+    const isGrid = !!layoutAct && layoutAct.screen_layout === 'grid';
+
     // Update screen preview inside the vector remote visual
     if (preview) {
       if (sbtns.length === 0) {
+        preview.style.display = "";
+        preview.style.gridTemplateColumns = "";
         preview.innerHTML = `
           <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:90px;color:#64748b;font-size:8px;text-align:center;padding:12px 4px;gap:4px;">
             <span style="font-size:12px;opacity:0.6;">📱</span>
@@ -666,7 +683,11 @@ export class HarmonyAppRemotesScreen extends HarmonyAppRemotesB25 {
           </div>
         `;
       } else {
-        preview.innerHTML = sbtns.slice(0, 6).map((b, idx) => {
+        // The remote shows 6 rows a page: 6 buttons in a list, 12 in two columns
+        preview.style.display = isGrid ? "grid" : "";
+        preview.style.gridTemplateColumns = isGrid ? "1fr 1fr" : "";
+        preview.style.gap = isGrid ? "3px" : "";
+        preview.innerHTML = sbtns.slice(0, isGrid ? 12 : 6).map((b, idx) => {
           const text = b.label || 'Btn ' + (idx + 1);
           return `
             <div class="remote-screen-tile" title="${escapeHtml(text)}" style="display:flex;align-items:center;justify-content:center;gap:4px;overflow:hidden;padding:0 3px;">
@@ -736,7 +757,7 @@ export class HarmonyAppRemotesScreen extends HarmonyAppRemotesB25 {
       const downBtn = row.querySelector('.screen-btn-down');
 
       const updatePreviewTile = () => {
-        if (preview && idx < 6) {
+        if (preview && idx < (isGrid ? 12 : 6)) {
           const tiles = preview.querySelectorAll('.remote-screen-tile');
           if (tiles[idx]) {
             const text = sbtns[idx].label || `Btn ${idx + 1}`;

@@ -58,7 +58,9 @@ export function writeRemoteConfig(module, { activities = [], devices = [], remot
     const stored = name.slice(0, String(a.id).length <= 2 ? 17 : 12); // short IDs leave 17 characters
     // The devices the activity uses, as indexes into the device list, as the Hub pushes them
     const devs = (a.deviceIds || []).map((id) => deviceIds.indexOf(String(id))).filter((i) => i >= 0).slice(0, 16);
-    return { id: remoteActivityId(a.id), name: name.slice(0, 39), ...iconFields(a.icon || a.Icon, name, a.type, stored), ...(devs.length ? { devs } : {}) };
+    // Touch buttons in two columns, as the Hub flags them in the activity chunk
+    const grid = remoteMap?.activities?.[String(a.id)]?.screen_layout === 'grid';
+    return { id: remoteActivityId(a.id), name: name.slice(0, 39), ...iconFields(a.icon || a.Icon, name, a.type, stored), ...(devs.length ? { devs } : {}), ...(grid ? { grid: 1 } : {}) };
   });
   const devs = pushedDevices.map((d) => {
     const name = String(d.name || d.Name);

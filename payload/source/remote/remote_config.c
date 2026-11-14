@@ -483,6 +483,9 @@ void save_rf_config(void) {
         if (g_rf_activities[i].icon_id > 0) {
             cJSON_AddNumberToObject(a, "icon_id", g_rf_activities[i].icon_id);
         }
+        if (g_rf_activities[i].screen_grid) {
+            cJSON_AddNumberToObject(a, "grid", 1);
+        }
         if (g_rf_activities[i].dev_count > 0) {
             cJSON *jd = cJSON_AddArrayToObject(a, "devs");
             for (int d = 0; d < g_rf_activities[i].dev_count; d++) {
@@ -625,6 +628,8 @@ void load_rf_config(void) {
                 }
                 cJSON *j_icon_id = cJSON_GetObjectItem(a, "icon_id");
                 g_rf_activities[g_rf_activity_count].icon_id = (j_icon_id && cJSON_IsNumber(j_icon_id)) ? (uint16_t)j_icon_id->valueint : 0;
+                cJSON *j_grid = cJSON_GetObjectItem(a, "grid");
+                g_rf_activities[g_rf_activity_count].screen_grid = (j_grid && cJSON_IsNumber(j_grid) && j_grid->valueint) ? 1 : 0;
                 rf_activity_t *ra = &g_rf_activities[g_rf_activity_count];
                 ra->dev_count = 0;
                 cJSON *jd = NULL;

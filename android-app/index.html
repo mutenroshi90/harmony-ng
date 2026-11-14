@@ -3264,8 +3264,17 @@
                   <div id="remoteScreenSectionHelp" class="help" style="margin-top: 2px;">Buttons shown on the remote's
                     touchscreen when pressing "DEVICES" during this activity (up to 48 buttons, 6 per page).</div>
                 </div>
-                <button id="btnRemoteAddScreenBtn" type="button" class="btn btn-xs btn-primary"
-                  data-i18n="add_screen_button">+ Add Screen Button</button>
+                <div style="display: flex; align-items: center; gap: 8px; flex-shrink: 0;">
+                  <label id="remoteScreenLayoutWrap" class="help" style="display: flex; align-items: center; gap: 6px; margin: 0;">
+                    <span data-i18n="screen_layout_label">Layout</span>
+                    <select id="remoteScreenLayoutSelect" class="form-control" style="font-size: 12px; padding: 3px 6px; width: auto;">
+                      <option value="list" data-i18n="screen_layout_list">List</option>
+                      <option value="grid" data-i18n="screen_layout_grid">Grid (2 columns)</option>
+                    </select>
+                  </label>
+                  <button id="btnRemoteAddScreenBtn" type="button" class="btn btn-xs btn-primary"
+                    data-i18n="add_screen_button">+ Add Screen Button</button>
+                </div>
               </div>
               <div id="remoteScreenButtonsList"
                 style="display: flex; flex-direction: column; gap: 8px; margin-top: 10px;">

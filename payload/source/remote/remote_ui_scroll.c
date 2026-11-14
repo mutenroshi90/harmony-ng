@@ -231,7 +231,10 @@ static struct {
 
 bool list_geometry(list_geom_t *g) {
     if (g_current_view == VIEW_DEVICES) {
-        *g = (list_geom_t){ 1, UI_CONTENT_Y, LIST_PAGE_SIZE, get_active_dev_cmd_count(), g_selected_device_cmd };
+        /* In two columns a row holds two buttons */
+        int n = get_active_dev_cmd_count();
+        if (devices_screen_grid()) *g = (list_geom_t){ 1, UI_CONTENT_Y, LIST_PAGE_SIZE, (n + 1) / 2, g_selected_device_cmd / 2 };
+        else *g = (list_geom_t){ 1, UI_CONTENT_Y, LIST_PAGE_SIZE, n, g_selected_device_cmd };
     } else if (g_current_view == VIEW_DEVICE_BROWSER) {
         *g = (list_geom_t){ 2 + g_browse_dev, browser_list_y(), browser_page_size(), browser_item_count(), g_browse_sel };
     } else {

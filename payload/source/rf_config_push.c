@@ -208,10 +208,22 @@ void *config_push_worker(void *arg) {
 
     for (int t = 0; t < num_targets; t++) {
         uint8_t target_slot = target_slots[t];
+        /* Which activities show their touch buttons in two columns ("screen_layout": "grid"
+           in the remote's button map) */
+        bool screen_grid[16] = {0};
+        pthread_mutex_lock(&g_map_lock);
+        cJSON *smap = get_remote_map_unlocked(target_slot);
+        const cJSON *sacts = smap ? cJSON_GetObjectItemCaseSensitive(smap, "activities") : NULL;
+        for (int i = 0; i < act_count && sacts; i++) {
+            const cJSON *sact = cJSON_GetObjectItemCaseSensitive(sacts, acts[i].id);
+            const cJSON *sl = sact ? cJSON_GetObjectItemCaseSensitive(sact, "screen_layout") : NULL;
+            screen_grid[i] = cJSON_IsString(sl) && strcmp(sl->valuestring, "grid") == 0;
+        }
+        pthread_mutex_unlock(&g_map_lock);
         for (int i = 0; i < act_count; i++) {
             uint8_t payload[26] = {0};
             payload[0] = (uint8_t)i;
-            payload[1] = (uint8_t)act_count;
+            payload[1] = (uint8_t)((act_count & RF_ACT_COUNT_MASK) | (screen_grid[i] ? RF_ACT_FLAG_SCREEN_GRID : 0));
             payload[2] = acts[i].icon_type;
             size_t name_room;
             if (strlen(acts[i].id) <= 2 || strcmp(acts[i].id, "-1") == 0) {

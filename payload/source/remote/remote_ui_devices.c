@@ -33,6 +33,21 @@ void execute_active_dev_cmd(int filtered_idx) {
     }
 }
 
+/* Whether the running activity shows its touch buttons in two columns (set per activity in the
+   Hub's web UI) */
+bool devices_screen_grid(void) {
+    const rf_activity_t *act = rf_activity_by_id(g_active_activity_id);
+    return act && act->screen_grid;
+}
+
+/* The button under a tap in the two-column view: the row from the list, the column from x */
+int devices_grid_index_at(int x, int y) {
+    int row = list_row_at(y);
+    if (row < 0) return -1;
+    int idx = row * 2 + (x >= FB_WIDTH / 2 ? 1 : 0);
+    return idx < get_active_dev_cmd_count() ? idx : -1;
+}
+
 void render_devices_screen(void) {
     int start_y = UI_CONTENT_Y;
     int card_h = LIST_ROW_H;
@@ -51,6 +66,37 @@ void render_devices_screen(void) {
     int scroll = list_scroll_offset();
     int first = scroll > 0 ? scroll / LIST_ROW_PITCH : 0;
     fb_clip_rows(g.y, g.y + g.rows * LIST_ROW_PITCH);
+
+    if (devices_screen_grid()) {
+        /* Two columns: a list row holds two buttons, the label centred in each */
+        int col_w = (FB_WIDTH - 16 - DEV_GRID_GAP) / 2;
+        for (int idx = first * 2; idx < total; idx++) {
+            int y = start_y + (idx / 2) * LIST_ROW_PITCH - scroll;
+            if (y >= g.y + g.rows * LIST_ROW_PITCH) break;
+            int x = 8 + (idx % 2) * (col_w + DEV_GRID_GAP);
+            bool is_sel = (idx == g_selected_device_cmd);
+
+            char label[32] = {0};
+            uint8_t bidx = 0, atype = 1;
+            get_active_dev_cmd_item(idx, label, sizeof(label), &bidx, &atype, NULL, 0);
+
+            fb_fill_round_rect(x, y, col_w, card_h, g_theme.corner_radius, is_sel ? RGB_CARD_SEL : RGB_CARD);
+            fb_draw_round_rect(x, y, col_w, card_h, g_theme.corner_radius, is_sel ? RGB_TEAL : g_theme.pal.outline);
+
+            const font_aa_t *f = g_theme.large_labels ? &g_font_title : &g_font_main;
+            if (f == &g_font_title && fb_text_width_aa(label, f) > col_w - 10) {
+                f = &g_font_main; /* a long label keeps more of its text in the smaller font */
+            }
+            char fit[RF_NAME_SIZE];
+            fb_fit_text_aa(fit, sizeof(fit), label, f, col_w - 10);
+            int ty = g_theme.large_labels ? y + (card_h - f->ascent) / 2 : y + 9;
+            fb_draw_text_aa(x + (col_w - fb_text_width_aa(fit, f)) / 2, ty, fit, is_sel ? RGB_WHITE : RGB_CYAN, f);
+        }
+        fb_clip_reset();
+        render_list_scrollbar();
+        return;
+    }
+
     for (int idx = first; idx < total; idx++) {
         int y = start_y + idx * LIST_ROW_PITCH - scroll;
         if (y >= g.y + g.rows * LIST_ROW_PITCH) break;
