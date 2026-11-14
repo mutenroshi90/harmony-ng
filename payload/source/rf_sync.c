@@ -103,6 +103,50 @@ void record_config_diff(int slot, const char *old_json_str, cJSON *norm) {
     }
 }
 
+void save_remote_theme(uint8_t slot, const uint8_t *p) {
+    if (slot < 1 || slot > 2) slot = 1;
+    char name[RF_THEME_NAME_MAX + 1] = {0};
+    size_t len = p[0] > RF_THEME_NAME_MAX ? RF_THEME_NAME_MAX : p[0];
+    for (size_t i = 0; i < len; i++) {
+        char c = (char)p[1 + i];
+        /* A theme directory name: anything else ends the name */
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_')) break;
+        name[i] = c;
+    }
+    if (!name[0]) return;
+
+    char path[64];
+    snprintf(path, sizeof(path), "/data/harmony/remote_slot%d_config.json", slot);
+    FILE *f = fopen(path, "r");
+    if (!f) return; /* the backup comes first and creates the file */
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) return;
+    const cJSON *cur = cJSON_GetObjectItem(root, "theme");
+    if (cJSON_IsString(cur) && strcmp(cur->valuestring, name) == 0) {
+        cJSON_Delete(root);
+        return; /* unchanged: leave the flash alone */
+    }
+    cJSON_DeleteItemFromObject(root, "theme");
+    cJSON_AddStringToObject(root, "theme", name);
+    char *txt = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!txt) return;
+    char tmp[72];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *w = fopen(tmp, "w");
+    if (w) {
+        fputs(txt, w);
+        fclose(w);
+        rename(tmp, path);
+        printf("[*] Remote slot %d uses theme %s\n", slot, name);
+    }
+    free(txt);
+}
+
 void save_remote_config_backup(uint8_t slot, const uint8_t *p) {
     if (slot < 1 || slot > 2) slot = 1;
     char path[64];

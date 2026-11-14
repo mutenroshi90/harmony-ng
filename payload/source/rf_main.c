@@ -245,6 +245,13 @@ void handle_rf_frame(const rf_frame_t *f) {
             break;
         }
 
+        case RF_MSG_THEME_REPORT: {
+            uint8_t slot = f->dev_slot & 0x0F;
+            if (slot < 1 || slot > 2) slot = 1;
+            save_remote_theme(slot, f->payload);
+            break;
+        }
+
         case RF_MSG_VERSION_REPORT: {
             uint8_t slot = f->dev_slot & 0x0F;
             if (slot < 1 || slot > 2) slot = 1;

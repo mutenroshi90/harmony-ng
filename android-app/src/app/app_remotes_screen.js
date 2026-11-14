@@ -55,7 +55,7 @@ import {
 import { HarmonyAppRemotesB25 } from './app_remotes_b25.js';
 
 // Names the build of the screen renderer in public/assets; change it whenever that build changes
-const REMOTE_PREVIEW_BUILD = "2.4.0-round-grid2";
+const REMOTE_PREVIEW_BUILD = "2.4.0-round-grid3";
 
 export class HarmonyAppRemotesScreen extends HarmonyAppRemotesB25 {
   async loadRemoteView() {
@@ -851,11 +851,17 @@ export class HarmonyAppRemotesScreen extends HarmonyAppRemotesB25 {
       });
     }
 
-    // The theme the preview draws with: the Hub does not know which one the remote uses, so the
-    // page offers the themes this build ships and remembers the choice in the browser
+    // The theme the preview draws with: the page starts with the one the remote reports
+    // (RF_MSG_THEME_REPORT, "theme" in its config backup) and lets the user look at the others
     const themeBar = document.getElementById('remoteScreenThemeBar');
-    let theme = 'classic';
-    try { theme = localStorage.getItem('remotePreviewTheme') || 'classic'; } catch { /* no storage */ }
+    if (this.remoteReportedTheme === undefined) {
+      this.remoteReportedTheme = null;
+      try {
+        const cfg = await this.client.request('/api/rf/remote-config?slot=1');
+        if (typeof cfg?.theme === 'string') this.remoteReportedTheme = cfg.theme;
+      } catch { /* no remote config yet */ }
+    }
+    let theme = this.remotePreviewTheme || this.remoteReportedTheme || 'classic';
     if (themeBar && !themeBar.dataset.bound) {
       themeBar.dataset.bound = '1';
       const list = await preview.themeList();
@@ -866,7 +872,7 @@ export class HarmonyAppRemotesScreen extends HarmonyAppRemotesB25 {
       themeBar.addEventListener('click', (e) => {
         const id = e.target.closest('[data-theme]')?.dataset.theme;
         if (!id) return;
-        try { localStorage.setItem('remotePreviewTheme', id); } catch { /* no storage */ }
+        this.remotePreviewTheme = id;
         this.updateRemoteScreenCanvas();
       });
     }
@@ -874,7 +880,10 @@ export class HarmonyAppRemotesScreen extends HarmonyAppRemotesB25 {
       if (!themeBar.querySelector(`[data-theme="${CSS.escape(theme)}"]`)) theme = 'classic';
     }
     if (!(await preview.loadTheme(module, theme))) theme = 'classic';
-    themeBar?.querySelectorAll('[data-theme]').forEach((b) => b.classList.toggle('active', b.dataset.theme === theme));
+    themeBar?.querySelectorAll('[data-theme]').forEach((b) => {
+      b.classList.toggle('active', b.dataset.theme === theme);
+      b.title = b.dataset.theme === this.remoteReportedTheme ? 'On the remote' : '';
+    });
 
     const isDevScope = this.remoteContextMode === 'device';
     const actId = this.remoteSelectedActivityId || document.getElementById('remoteActivitySelect')?.value || '-1';

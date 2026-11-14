@@ -110,6 +110,13 @@
 #define RF_UNIT_ID_MAX             24
 #define RF_UNIT_ID_SKIN_OFF        24
 
+/* Remote -> Hub: the name of the theme the remote draws with (its directory under /data/themes, or
+ * "classic"), since the settings backup carries ids only for the built-in themes. payload[0] =
+ * length, payload[1..] = the name as ASCII. Sent right after every RF_MSG_REMOTE_CONFIG_BACKUP;
+ * older Hubs drop it as unknown. */
+#define RF_MSG_THEME_REPORT        0x32
+#define RF_THEME_NAME_MAX          23
+
 /* RF_MSG_HELP_STATUS payload[0] */
 #define RF_HELP_QUESTION           0x00  /* [1] index, [2] count, [3..10] device id, [11..24] name */
 #define RF_HELP_STARTED            0x01  /* re-sending the activity's commands */
@@ -164,7 +171,7 @@ static inline int rf_is_valid_frame(const uint8_t *raw, size_t len) {
             uint8_t t = raw[5];
             return (t >= RF_MSG_ACTIVITY_SYNC && t <= RF_MSG_DEVICE_CMD_INDEX) ||
                    (t >= RF_MSG_BUTTON_PRESS && t <= RF_MSG_SLEEP_REQ) ||
-                   (t >= RF_MSG_OTA_START && t <= RF_MSG_UNIT_ID) ||
+                   (t >= RF_MSG_OTA_START && t <= RF_MSG_THEME_REPORT) ||
                    (t == RF_MSG_ACK || t == RF_MSG_PING);
         }
         return 0;
@@ -174,7 +181,7 @@ static inline int rf_is_valid_frame(const uint8_t *raw, size_t len) {
             uint8_t t = raw[3];
             return (t >= RF_MSG_ACTIVITY_SYNC && t <= RF_MSG_DEVICE_CMD_INDEX) ||
                    (t >= RF_MSG_BUTTON_PRESS && t <= RF_MSG_SLEEP_REQ) ||
-                   (t >= RF_MSG_OTA_START && t <= RF_MSG_UNIT_ID) ||
+                   (t >= RF_MSG_OTA_START && t <= RF_MSG_THEME_REPORT) ||
                    (t == RF_MSG_ACK || t == RF_MSG_PING);
         }
         return 0;
