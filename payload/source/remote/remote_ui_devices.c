@@ -126,7 +126,7 @@ void render_devices_screen(void) {
             char fit[RF_NAME_SIZE];
             fb_fit_text_aa(fit, sizeof(fit), label, f, col_w - 10);
             int ty = g_theme.large_labels ? y + (card_h - f->ascent) / 2 : y + 9;
-            fb_draw_text_aa(x + (col_w - fb_text_width_aa(fit, f)) / 2, ty, fit, is_sel ? RGB_WHITE : RGB_CYAN, f);
+            fb_draw_text_aa(x + (col_w - fb_text_width_aa(fit, f)) / 2, ty, fit, is_sel ? RGB_WHITE : (g_theme.uniform_lists ? RGB_TEXT_MUTED : RGB_CYAN), f);
         }
         fb_clip_reset();
         render_list_scrollbar();
@@ -155,7 +155,7 @@ void render_devices_screen(void) {
         }
 
         int text_x = has_btn_icon ? 42 : 16;
-        draw_row_label(text_x, y, card_h, label, is_sel ? RGB_WHITE : RGB_CYAN);
+        draw_row_label(text_x, y, card_h, label, is_sel ? RGB_WHITE : (g_theme.uniform_lists ? RGB_TEXT_MUTED : RGB_CYAN));
 
         if (is_sel && g_theme.chevrons) {
             fb_draw_text_aa(FB_WIDTH - 24, y + 8, ">", RGB_CYAN, &g_font_title);
@@ -305,7 +305,7 @@ void render_device_browser_view(void) {
         }
 
         int text_x = has_icon ? 14 + icon_size + 6 : 16;
-        draw_row_label(text_x, y, card_h, label, is_sel ? RGB_WHITE : RGB_CYAN);
+        draw_row_label(text_x, y, card_h, label, is_sel ? RGB_WHITE : (g_theme.uniform_lists ? RGB_TEXT_MUTED : RGB_CYAN));
         if (g_browse_dev < 0 && g_theme.chevrons) {
             fb_draw_text_aa(FB_WIDTH - 24, y + 8, ">", is_sel ? RGB_CYAN : RGB_TEXT_MUTED, &g_font_title);
         }

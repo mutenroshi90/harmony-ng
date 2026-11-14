@@ -120,6 +120,7 @@ void theme_load(const char *name) {
     g_theme.chevrons = true;
     g_theme.large_labels = false;
     g_theme.header_help = false;
+    g_theme.uniform_lists = false;
     g_theme.wallpaper[0] = '\0';
     g_theme.line_art[0] = 245; g_theme.line_art[1] = 245; g_theme.line_art[2] = 250;
     g_theme.font_main = main_font;
@@ -167,6 +168,8 @@ void theme_load(const char *name) {
     if (cJSON_IsBool(large_labels)) g_theme.large_labels = cJSON_IsTrue(large_labels);
     const cJSON *header_help = cJSON_GetObjectItem(root, "header_help");
     if (cJSON_IsBool(header_help)) g_theme.header_help = cJSON_IsTrue(header_help);
+    const cJSON *uniform = cJSON_GetObjectItem(root, "uniform_lists");
+    if (cJSON_IsBool(uniform)) g_theme.uniform_lists = cJSON_IsTrue(uniform);
     const cJSON *radius = cJSON_GetObjectItem(root, "corner_radius");
     if (cJSON_IsNumber(radius)) {
         int r = radius->valueint;

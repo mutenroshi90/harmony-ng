@@ -182,8 +182,10 @@ int home_card_device_at(int y) {
 static void draw_activity_icon(int idx, int icon_x, int icon_y, bool is_sel, bool grid) {
     /* The well sits inside the card, so its corners are a little tighter than the card's */
     int well_r = g_theme.corner_radius > 3 ? g_theme.corner_radius - 3 : g_theme.corner_radius;
-    fb_fill_round_rect(icon_x - 2, icon_y - 2, 44, 44, well_r, is_sel ? g_theme.pal.icon_well_sel : g_theme.pal.icon_well);
-    fb_draw_round_rect(icon_x - 2, icon_y - 2, 44, 44, well_r, is_sel && !grid ? RGB_TEAL : g_theme.pal.icon_well_border);
+    /* With uniform lists the card's outline alone shows the selection */
+    bool well_sel = is_sel && !g_theme.uniform_lists;
+    fb_fill_round_rect(icon_x - 2, icon_y - 2, 44, 44, well_r, well_sel ? g_theme.pal.icon_well_sel : g_theme.pal.icon_well);
+    fb_draw_round_rect(icon_x - 2, icon_y - 2, 44, 44, well_r, well_sel && !grid ? RGB_TEAL : g_theme.pal.icon_well_border);
 
     bool has_icon = false;
     if (g_activities[idx].icon_path[0]) {
@@ -220,7 +222,7 @@ static void render_activity_page(int page_start, int y_off) {
         bool is_confirm_pending = (g_confirm_pending_idx == idx);
         uint16_t bg = is_confirm_pending ? g_theme.pal.warning_bg : (is_sel ? RGB_CARD_SEL : RGB_CARD);
         uint16_t border = is_confirm_pending ? RGB_YELLOW : (is_sel ? RGB_TEAL : g_theme.pal.outline);
-        uint16_t mark = is_confirm_pending ? RGB_YELLOW : (is_active ? RGB_GREEN : (is_sel ? RGB_TEAL : 0));
+        uint16_t mark = is_confirm_pending ? RGB_YELLOW : (is_active ? RGB_GREEN : (is_sel && !g_theme.uniform_lists ? RGB_TEAL : 0));
         uint16_t text_color = (is_sel || is_active || is_confirm_pending) ? RGB_WHITE : RGB_TEXT_MUTED;
 
         int radius = g_theme.corner_radius;

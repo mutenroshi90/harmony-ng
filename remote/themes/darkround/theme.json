@@ -5,6 +5,7 @@
   "chevrons": false,
   "large_labels": true,
   "header_help": true,
+  "uniform_lists": true,
   "palette": {
     "bg": "#0E1116",
     "card": "#171B22",

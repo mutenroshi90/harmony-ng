@@ -64,6 +64,9 @@ typedef struct {
                                   "large_labels", default false) */
     bool header_help;          /* help key in the status bar instead of the gear menu while an
                                   activity runs (theme.json "header_help", default false) */
+    bool uniform_lists;        /* lists look like the activity list: the selection shows by the card's
+                                  outline only, unselected labels are muted (theme.json
+                                  "uniform_lists", default false) */
     uint8_t line_art[3];       /* RGB the dark pixels of stock line art are drawn in: near-white on
                                   dark themes, dark on light ones (theme.json "line_art") */
 } theme_t;
