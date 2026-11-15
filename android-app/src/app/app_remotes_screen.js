@@ -728,7 +728,8 @@ export class HarmonyAppRemotesScreen extends HarmonyAppRemotesB25 {
 
       return `
         <div class="screen-btn-row" data-idx="${idx}">
-          <span class="screen-btn-num">${idx + 1}</span>
+          <input type="text" inputmode="numeric" class="screen-btn-num screen-btn-pos" value="${idx + 1}" title="Position (1–${sbtns.length})">
+
           <div style="display: flex; gap: 2px;">
             <button type="button" class="btn btn-xs btn-ghost screen-btn-up" title="Move Up" ${idx === 0 ? 'disabled style="opacity:0.3;cursor:default;"' : ''}>▲</button>
             <button type="button" class="btn btn-xs btn-ghost screen-btn-down" title="Move Down" ${idx === sbtns.length - 1 ? 'disabled style="opacity:0.3;cursor:default;"' : ''}>▼</button>
@@ -804,6 +805,32 @@ export class HarmonyAppRemotesScreen extends HarmonyAppRemotesB25 {
           this.renderRemoteScreenButtons();
         }
       });
+
+      // Type a position number to move the button there directly
+      const posIn = row.querySelector('.screen-btn-pos');
+      if (posIn) {
+        const applyPos = () => {
+          const want = parseInt(posIn.value, 10);
+          if (isNaN(want)) { posIn.value = idx + 1; return; }
+          const to = Math.min(Math.max(want, 1), sbtns.length) - 1;
+          if (to === idx) { posIn.value = idx + 1; return; }
+          const item = sbtns.splice(idx, 1)[0];
+          sbtns.splice(to, 0, item);
+          this.renderRemoteScreenButtons();
+          const moved = sbtnsList.querySelector(`.screen-btn-row[data-idx="${to}"]`);
+          if (moved) {
+            moved.scrollIntoView({ block: 'nearest' });
+            moved.classList.add('screen-btn-moved');
+            setTimeout(() => moved.classList.remove('screen-btn-moved'), 900);
+          }
+        };
+        posIn.addEventListener('focus', () => posIn.select());
+        posIn.addEventListener('change', applyPos);
+        posIn.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') { e.preventDefault(); posIn.blur(); }
+          else if (e.key === 'Escape') { posIn.value = idx + 1; posIn.blur(); }
+        });
+      }
 
       devSel?.addEventListener('change', (e) => {
         const newDevId = e.target.value;
