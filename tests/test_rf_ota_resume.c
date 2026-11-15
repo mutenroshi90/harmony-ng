@@ -7,6 +7,8 @@
 #include <assert.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <signal.h>
+#include <sys/resource.h>
 
 #include "remote/remote_state.h"
 #include "remote/remote_rf_ota.h"
@@ -205,6 +207,183 @@ int main(void) {
     assert(rd == test_size);
     assert(memcmp(written_data, synthetic_data, test_size) == 0);
     printf("[+] Step 6 passed: Written file matches synthetic test payload 100%% byte-for-byte!\n");
+
+    /* 8. Step 7: installing the binary keeps the old one unless the new one is complete */
+    {
+        char dir[] = "/tmp/remote_ota_install_XXXXXX";
+        assert(mkdtemp(dir) != NULL);
+        char cur[128], neu[128], bak[128], src[128];
+        snprintf(cur, sizeof(cur), "%s/remote_ui", dir);
+        snprintf(neu, sizeof(neu), "%s/remote_ui.new", dir);
+        snprintf(bak, sizeof(bak), "%s/remote_ui.bak", dir);
+        snprintf(src, sizeof(src), "%s/package_remote_ui", dir);
+        FILE *fo = fopen(cur, "wb");
+        assert(fo); fputs("old binary", fo); fclose(fo);
+        FILE *fs = fopen(src, "wb");
+        assert(fs); fwrite(synthetic_data, 1, test_size, fs); fclose(fs);
+        uint8_t back[2200];
+        struct stat st;
+
+        /* not enough free space: refused before anything is written */
+        assert(ota_stage_file(src, neu, (uint64_t)1 << 62) != 0);
+        assert(access(neu, F_OK) != 0);
+
+        /* the copy stops part-way (no space left): refused, nothing left behind */
+        struct rlimit old_lim, lim;
+        getrlimit(RLIMIT_FSIZE, &old_lim);
+        lim = old_lim;
+        lim.rlim_cur = 1024;
+        signal(SIGXFSZ, SIG_IGN);
+        setrlimit(RLIMIT_FSIZE, &lim);
+        int cut_rc = ota_stage_file(src, neu, 0);
+        setrlimit(RLIMIT_FSIZE, &old_lim);
+        assert(cut_rc != 0);
+        assert(access(neu, F_OK) != 0);
+
+        /* nothing to switch to: the current binary stays */
+        assert(ota_replace_file(neu, cur, bak) != 0);
+        FILE *fc = fopen(cur, "rb");
+        assert(fc); size_t n = fread(back, 1, sizeof(back), fc); fclose(fc);
+        assert(n == strlen("old binary") && memcmp(back, "old binary", n) == 0);
+
+        /* a complete copy is switched in with one rename, the old binary kept as the backup */
+        assert(ota_stage_file(src, neu, 0) == 0);
+        assert(stat(neu, &st) == 0 && st.st_size == (off_t)test_size && (st.st_mode & 0111));
+        assert(ota_replace_file(neu, cur, bak) == 0);
+        fc = fopen(cur, "rb");
+        assert(fc); n = fread(back, 1, sizeof(back), fc); fclose(fc);
+        assert(n == test_size && memcmp(back, synthetic_data, test_size) == 0);
+        fc = fopen(bak, "rb");
+        assert(fc); n = fread(back, 1, sizeof(back), fc); fclose(fc);
+        assert(n == strlen("old binary") && memcmp(back, "old binary", n) == 0);
+        assert(access(neu, F_OK) != 0);
+
+        unlink(cur); unlink(bak); unlink(src); rmdir(dir);
+        printf("[+] Step 7 passed: binary install is refused without space or on a cut copy, and switched by rename\n");
+    }
+
+    /* 9. Step 8: the boot hook and the scripts of a package are installed all or none, by rename */
+    {
+        char root[] = "/tmp/remote_ota_files_XXXXXX";
+        assert(mkdtemp(root) != NULL);
+        char pkg[128], data[128], initd[128], path[256];
+        snprintf(pkg, sizeof(pkg), "%s/pkg", root);
+        snprintf(data, sizeof(data), "%s/data", root);
+        snprintf(initd, sizeof(initd), "%s/initd", root);
+        assert(mkdir(pkg, 0755) == 0 && mkdir(data, 0755) == 0 && mkdir(initd, 0755) == 0);
+        char big[2048];
+        memset(big, '#', sizeof(big));
+        struct { const char *dir, *name, *text; } seed[] = {
+            { pkg, "rcS.local", "new boot hook" }, { pkg, "init.sh", NULL }, { pkg, "remote_sync", "new sync" },
+            { pkg, "remote_ui", "not a script" }, { pkg, "notes.txt", "not installed" },
+            { data, "init.sh", "old init" }, { data, "rcS.local", "old data hook" }, { initd, "rcS.local", "old boot hook" },
+        };
+        for (size_t i = 0; i < sizeof(seed) / sizeof(seed[0]); i++) {
+            snprintf(path, sizeof(path), "%s/%s", seed[i].dir, seed[i].name);
+            FILE *fw = fopen(path, "wb");
+            assert(fw);
+            if (seed[i].text) fputs(seed[i].text, fw);
+            else fwrite(big, 1, sizeof(big), fw); /* the new init.sh: larger than the cut below */
+            fclose(fw);
+        }
+#define READ_BACK(dir, name, buf) do { snprintf(path, sizeof(path), "%s/%s", dir, name); \
+            FILE *fr_ = fopen(path, "rb"); assert(fr_); size_t n_ = fread(buf, 1, sizeof(buf) - 1, fr_); \
+            buf[n_] = 0; fclose(fr_); } while (0)
+#define GONE(dir, name) (snprintf(path, sizeof(path), "%s/%s", dir, name), access(path, F_OK) != 0)
+        char got[4096];
+
+        ota_file_t files[OTA_MAX_PKG_FILES];
+        int n = ota_package_files(pkg, data, initd, files, OTA_MAX_PKG_FILES);
+        assert(n == 4); /* rcS.local twice, init.sh, remote_sync */
+
+        /* not enough space: nothing staged, every installed file unchanged */
+        assert(ota_stage_files(files, n, (uint64_t)1 << 62) != 0);
+        assert(GONE(initd, "rcS.local.new") && GONE(data, "init.sh.new"));
+
+        /* a copy cut part-way (no space left): the files staged before it are removed too */
+        struct rlimit old_lim, lim;
+        getrlimit(RLIMIT_FSIZE, &old_lim);
+        lim = old_lim;
+        lim.rlim_cur = 1024;
+        signal(SIGXFSZ, SIG_IGN);
+        setrlimit(RLIMIT_FSIZE, &lim);
+        int cut_rc = ota_stage_files(files, n, 0);
+        setrlimit(RLIMIT_FSIZE, &old_lim);
+        assert(cut_rc != 0);
+        assert(GONE(initd, "rcS.local.new") && GONE(data, "rcS.local.new") && GONE(data, "init.sh.new") &&
+               GONE(data, "remote_sync.new"));
+        READ_BACK(initd, "rcS.local", got); assert(strcmp(got, "old boot hook") == 0);
+        READ_BACK(data, "init.sh", got); assert(strcmp(got, "old init") == 0);
+
+        /* complete: switched by rename, old versions kept as .bak, a reader of the old init.sh
+         * (the running supervisor) still reads the old text */
+        snprintf(path, sizeof(path), "%s/init.sh", data);
+        FILE *running = fopen(path, "rb");
+        assert(running);
+        assert(ota_stage_files(files, n, 0) == 0);
+        assert(ota_commit_files(files, n) == 0);
+        READ_BACK(initd, "rcS.local", got); assert(strcmp(got, "new boot hook") == 0);
+        READ_BACK(data, "rcS.local", got); assert(strcmp(got, "new boot hook") == 0);
+        READ_BACK(data, "remote_sync", got); assert(strcmp(got, "new sync") == 0);
+        READ_BACK(data, "init.sh", got); assert(strlen(got) == sizeof(big));
+        READ_BACK(initd, "rcS.local.bak", got); assert(strcmp(got, "old boot hook") == 0);
+        READ_BACK(data, "rcS.local.bak", got); assert(strcmp(got, "old data hook") == 0);
+        READ_BACK(data, "init.sh.bak", got); assert(strcmp(got, "old init") == 0);
+        assert(GONE(data, "remote_sync.bak")); /* no earlier version: no backup */
+        assert(GONE(data, "notes.txt") && GONE(data, "remote_ui"));
+        size_t rn = fread(got, 1, sizeof(got) - 1, running);
+        got[rn] = 0;
+        fclose(running);
+        assert(strcmp(got, "old init") == 0);
+        struct stat sst;
+        snprintf(path, sizeof(path), "%s/init.sh", data);
+        assert(stat(path, &sst) == 0 && (sst.st_mode & 0111));
+        assert(GONE(initd, "rcS.local.new") && GONE(data, "init.sh.new"));
+#undef READ_BACK
+#undef GONE
+        char cmd[200];
+        snprintf(cmd, sizeof(cmd), "rm -rf '%s'", root);
+        assert(system(cmd) == 0);
+        printf("[+] Step 8 passed: boot hook and scripts staged all or none, switched by rename, old kept as .bak\n");
+    }
+
+    /* 10. Step 9: an update installed while the backup runs keeps that backup */
+    {
+        char dir[] = "/tmp/remote_ota_onbak_XXXXXX";
+        assert(mkdtemp(dir) != NULL);
+        char cur[128], neu[128], bak[128], lnk_dir[128], lnk[160], got[64];
+        snprintf(cur, sizeof(cur), "%s/remote_ui", dir);
+        snprintf(neu, sizeof(neu), "%s/remote_ui.new", dir);
+        snprintf(bak, sizeof(bak), "%s/remote_ui.bak", dir);
+        snprintf(lnk_dir, sizeof(lnk_dir), "%s/fallback", dir);
+        snprintf(lnk, sizeof(lnk), "%s/remote_ui", lnk_dir);
+        assert(mkdir(lnk_dir, 0755) == 0);
+        assert(symlink(bak, lnk) == 0); /* how the supervisor starts the backup */
+#define PUT(path, text) do { FILE *fp_ = fopen(path, "wb"); assert(fp_); fputs(text, fp_); fclose(fp_); } while (0)
+#define GET(path) do { FILE *fp_ = fopen(path, "rb"); assert(fp_); size_t n_ = fread(got, 1, sizeof(got) - 1, fp_); \
+            got[n_] = 0; fclose(fp_); } while (0)
+        /* running the backup (through its link): the failing binary is replaced, the backup kept */
+        PUT(cur, "failing binary"); PUT(bak, "good backup"); PUT(neu, "new binary");
+        assert(ota_install_binary(neu, cur, bak, lnk) == 0);
+        GET(cur); assert(strcmp(got, "new binary") == 0);
+        GET(bak); assert(strcmp(got, "good backup") == 0);
+        assert(access(neu, F_OK) != 0);
+
+        /* running the installed binary: it becomes the backup, as before */
+        PUT(neu, "newer binary");
+        assert(ota_install_binary(neu, cur, bak, cur) == 0);
+        GET(cur); assert(strcmp(got, "newer binary") == 0);
+        GET(bak); assert(strcmp(got, "new binary") == 0);
+
+        /* this test program is neither: same as above */
+        PUT(neu, "newest binary");
+        assert(ota_install_binary(neu, cur, bak, "/proc/self/exe") == 0);
+        GET(bak); assert(strcmp(got, "newer binary") == 0);
+#undef PUT
+#undef GET
+        unlink(lnk); rmdir(lnk_dir); unlink(cur); unlink(bak); rmdir(dir);
+        printf("[+] Step 9 passed: an update installed while the backup runs keeps the backup\n");
+    }
 
     /* Clean up */
     unlink("/tmp/remote_ui.ota.gz");

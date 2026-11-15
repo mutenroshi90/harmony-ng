@@ -10,26 +10,11 @@ else
   BB="busybox"
 fi
 
-CA_BUNDLE=""
-for c in /data/harmony/cacert.pem /opt/luaworks/cacert.pem /etc/ssl/cert.pem /etc/ssl/certs/ca-certificates.crt; do
-  if [ -s "$c" ]; then
-    CA_BUNDLE="$c"
-    break
-  fi
-done
-
-if [ -n "$CA_BUNDLE" ]; then
-  export SSL_CERT_FILE="$CA_BUNDLE"
-  export SSL_CERT_DIR="$(dirname "$CA_BUNDLE")"
-  if $BB wget --help 2>&1 | grep -q 'ca-certificate'; then
-    WGET="$BB wget --ca-certificate=$CA_BUNDLE"
-  else
-    WGET="$BB wget"
-  fi
-else
-  WGET="$BB wget --no-check-certificate"
-fi
-MD5SUM="$BB md5sum"
+# busybox wget does not verify TLS certificates, so nothing downloaded here is trusted until
+# hub_util ota-verify has checked it: the Ed25519 signature of manifest.json against the release
+# keys built into the firmware, then the SHA-256 of every file against the signed manifest.
+WGET="$BB wget"
+HUB_UTIL=/data/harmony/bin/hub_util
 TAR="$BB tar"
 
 CMD="${1:-apply}"
@@ -82,6 +67,120 @@ download_retry() {
     i=$((i + 1))
   done
   return 1
+}
+
+# Download manifest.json and manifest.json.sig into $1 and verify the signature; prints the
+# release version. Fails when either is missing or the signature does not match a release key.
+fetch_signed_manifest() {
+  local dir="$1"
+  rm -f "$dir/manifest.json" "$dir/manifest.json.sig"
+  if ! download_retry "${REPO}/manifest.json?_=${TIMESTAMP}" "$dir/manifest.json" 10 3; then
+    echo "[-] Release manifest (manifest.json) missing from ${REPO}." >&2
+    return 1
+  fi
+  if ! download_retry "${REPO}/manifest.json.sig?_=${TIMESTAMP}" "$dir/manifest.json.sig" 10 3; then
+    echo "[-] Release signature (manifest.json.sig) missing from ${REPO}." >&2
+    return 1
+  fi
+  if [ ! -x "$HUB_UTIL" ]; then
+    echo "[-] $HUB_UTIL missing: cannot check the release signature." >&2
+    return 1
+  fi
+  "$HUB_UTIL" ota-verify "$dir/manifest.json" "$dir/manifest.json.sig"
+}
+
+# Check downloaded files (key=path ...) against the signed manifest in $TMPDIR.
+verify_files() {
+  "$HUB_UTIL" ota-verify "$TMPDIR/manifest.json" "$TMPDIR/manifest.json.sig" "$@" >/dev/null
+}
+
+# Files are installed one at a time from the verified copy in RAM (/tmp): each is copied to
+# <dest>.new on the same file system, checked by MD5 and renamed over the installed file. So each
+# file is always whole (the old or the new one, never cut) and the flash needs room for one new
+# file at a time, not for the whole release. A running program or script (update.sh itself) keeps
+# its old file until it exits. A failure part way leaves some files new and the rest old; VERSION
+# is written only after every file is in place, so the update can be run again.
+INSTALLING=""
+
+file_md5() {
+  md5sum "$1" 2>/dev/null | cut -d' ' -f1
+}
+
+# install_file SRC DEST MODE: replace DEST with SRC; skipped when DEST already matches.
+install_file() {
+  _want=$(file_md5 "$1")
+  if [ -z "$_want" ]; then
+    echo "[-] Cannot read $1."
+    return 1
+  fi
+  if [ -f "$2" ] && [ ! -L "$2" ] && [ "$(file_md5 "$2")" = "$_want" ]; then
+    chmod "$3" "$2" 2>/dev/null
+    return 0
+  fi
+  INSTALLING="$2.new"
+  rm -f "$2.new" 2>/dev/null
+  if ! cp "$1" "$2.new" 2>/dev/null || [ "$(file_md5 "$2.new")" != "$_want" ] || \
+     ! chmod "$3" "$2.new" 2>/dev/null; then
+    echo "[-] Could not write $2.new (flash full?)."
+    rm -f "$2.new" 2>/dev/null
+    INSTALLING=""
+    return 1
+  fi
+  if ! mv -f "$2.new" "$2" 2>/dev/null; then
+    echo "[-] Could not rename $2.new to $2."
+    rm -f "$2.new" 2>/dev/null
+    INSTALLING=""
+    return 1
+  fi
+  INSTALLING=""
+  return 0
+}
+
+# Binaries of the unified package that go to /data/harmony/bin
+BUNDLE_BINS="hub_daemon hub_rf hub_btstack dropbearmulti hub_sync register_ehci eth_fix"
+
+# install_bundle PKG: install every file of the unpacked package; stops at the first failure.
+install_bundle() {
+  _pkg="$1"
+  # A. Scripts -> /data/harmony/, rcS.local also -> /etc/init.d/
+  if [ -d "$_pkg/scripts" ]; then
+    for _f in "$_pkg/scripts/"*; do
+      [ -f "$_f" ] || continue
+      install_file "$_f" "/data/harmony/${_f##*/}" 755 || return 1
+    done
+    if [ -f "$_pkg/scripts/rcS.local" ]; then
+      install_file "$_pkg/scripts/rcS.local" /etc/init.d/rcS.local 755 || return 1
+    fi
+  fi
+  # CA Bundle -> /data/harmony/cacert.pem
+  if [ -f "$_pkg/config/cacert.pem" ]; then
+    install_file "$_pkg/config/cacert.pem" /data/harmony/cacert.pem 644 || return 1
+  elif [ -f "$_pkg/cacert.pem" ]; then
+    install_file "$_pkg/cacert.pem" /data/harmony/cacert.pem 644 || return 1
+  fi
+  # B. Application binaries -> /data/harmony/bin/
+  for _b in hub_util $BUNDLE_BINS; do
+    if [ -f "$_pkg/bin/$_b" ]; then
+      install_file "$_pkg/bin/$_b" "/data/harmony/bin/$_b" 755 || return 1
+    fi
+  done
+  # C. BusyBox -> /cache/bin/
+  if [ -f "$_pkg/bin/busybox" ]; then
+    install_file "$_pkg/bin/busybox" /cache/bin/busybox 755 || return 1
+  fi
+  # F. Icons archive -> /cache/icons.tar.gz
+  if [ -f "$_pkg/icons.tar.gz" ]; then
+    install_file "$_pkg/icons.tar.gz" /cache/icons.tar.gz 644 || return 1
+  fi
+  return 0
+}
+
+# The helpers built into hub_util are symlinks to it
+link_hub_util() {
+  for _app in hub_sync sync mknod register_ehci eth_fix hub_dhcpd hub_portal hub_sntp; do
+    [ -f "/data/harmony/bin/$_app" ] && [ ! -L "/data/harmony/bin/$_app" ] && rm -f "/data/harmony/bin/$_app" 2>/dev/null || true
+    ln -sf /data/harmony/bin/hub_util "/data/harmony/bin/$_app" 2>/dev/null || true
+  done
 }
 
 get_local_version() {
@@ -183,22 +282,22 @@ EOF
 do_apply() {
   touch /tmp/hub_updating.flag 2>/dev/null || true
   TMPDIR="/tmp/ota_update"
-  trap 'rm -f /tmp/hub_updating.flag; rm -rf "$TMPDIR" 2>/dev/null' EXIT INT TERM
+  trap 'rm -f $INSTALLING /tmp/hub_updating.flag; rm -rf "$TMPDIR" 2>/dev/null' EXIT
+  # A kill ends the install (the file being copied stays the old one)
+  trap 'exit 1' INT TERM
   echo "[*] Starting software update from ${REPO}..."
   LOCAL_VER=$(get_local_version)
   
   rm -rf "$TMPDIR" 2>/dev/null
   mkdir -p "$TMPDIR"
 
-  # 1. Fetch remote version
-  NEW_VER=""
-  if download_retry "${REPO}/v2/VERSION?_=${TIMESTAMP}" "$TMPDIR/VERSION" 8 2 || \
-     download_retry "${REPO}/VERSION_V2?_=${TIMESTAMP}" "$TMPDIR/VERSION" 8 2 || \
-     download_retry "${REPO}/VERSION?_=${TIMESTAMP}" "$TMPDIR/VERSION" 8 3; then
-    NEW_VER=$(cat "$TMPDIR/VERSION" | tr -d '\r\n v')
+  # 1. Fetch and verify the signed release manifest; its version is the version installed
+  NEW_VER=$(fetch_signed_manifest "$TMPDIR")
+  if [ $? -ne 0 ] || [ -z "$NEW_VER" ]; then
+    echo "[-] Update refused: no valid release signature from ${REPO}. Nothing was changed."
+    return 1
   fi
-  [ -z "$NEW_VER" ] && [ -f /data/harmony/latest_version ] && NEW_VER=$(cat /data/harmony/latest_version 2>/dev/null | tr -d '\r\n v')
-  [ -z "$NEW_VER" ] && NEW_VER="2.0.0"
+  echo "[+] Release manifest v${NEW_VER} signed by a release key."
 
   # Major version guard
   LOCAL_MAJOR=$(echo "$LOCAL_VER" | cut -d. -f1)
@@ -222,83 +321,41 @@ do_apply() {
 
   echo "[*] Updating Hub from v${LOCAL_VER} to v${NEW_VER}..."
 
-  mkdir -p /data/harmony/bin /cache/bin /cache/www 2>/dev/null
-
-  # Prune redundant/bloated binaries to ensure flash space
-  rm -f /cache/bin/hub_portal /cache/bin/hub_dhcpd /cache/bin/hub_sntp /data/harmony/bin/mknod 2>/dev/null || true
-
   # 2. Attempt unified RAM bundle update (hub_ota.tar.gz)
   OTA_BUNDLE_OK=0
+  INSTALL_OK=0
   echo "[*] Checking for unified Hub package (hub_ota.tar.gz)..."
   if download_retry "${REPO}/hub_ota.tar.gz?_=${TIMESTAMP}" "$TMPDIR/hub_ota.tar.gz" 35 3; then
     echo "[+] Downloaded unified OTA package to RAM ($TMPDIR/hub_ota.tar.gz)."
 
-    # Verify MD5 checksum (MANDATORY)
-    echo "[*] Fetching and verifying mandatory MD5 checksum..."
-    if ! download_retry "${REPO}/hub_ota.tar.gz.md5?_=${TIMESTAMP}" "$TMPDIR/hub_ota.tar.gz.md5" 8 2 && \
-       ! download_retry "${REPO}/hub_ota.md5?_=${TIMESTAMP}" "$TMPDIR/hub_ota.tar.gz.md5" 8 2; then
-      echo "[-] Mandatory checksum file (.md5) missing or unreachable from ${REPO}. Aborting update."
+    # The package must match the SHA-256 in the signed manifest
+    if ! verify_files "hub_ota.tar.gz=$TMPDIR/hub_ota.tar.gz"; then
+      echo "[-] hub_ota.tar.gz does not match the signed manifest. Aborting update, nothing was changed."
       rm -rf "$TMPDIR" 2>/dev/null
       return 1
     fi
-
-    EXPECTED_MD5=$(awk '{print $1}' "$TMPDIR/hub_ota.tar.gz.md5" | tr -d '\r\n ')
-    if [ -z "$EXPECTED_MD5" ]; then
-      echo "[-] Invalid or empty MD5 checksum file. Aborting update."
-      rm -rf "$TMPDIR" 2>/dev/null
-      return 1
-    fi
-
-    ACTUAL_MD5=$($MD5SUM "$TMPDIR/hub_ota.tar.gz" 2>/dev/null | awk '{print $1}')
-    if [ "$EXPECTED_MD5" != "$ACTUAL_MD5" ]; then
-      echo "[-] Checksum mismatch for hub_ota.tar.gz (expected $EXPECTED_MD5, got $ACTUAL_MD5). Aborting."
-      rm -rf "$TMPDIR" 2>/dev/null
-      return 1
-    fi
-    echo "[+] MD5 checksum verified successfully ($ACTUAL_MD5)."
+    echo "[+] hub_ota.tar.gz matches the signed manifest."
 
     mkdir -p "$TMPDIR/pkg" 2>/dev/null
     if $TAR -xzf "$TMPDIR/hub_ota.tar.gz" -C "$TMPDIR/pkg/" 2>/dev/null; then
-      echo "[*] Extracting package to flash partitions..."
-      # A. Scripts -> /data/harmony/
-      if [ -d "$TMPDIR/pkg/scripts" ]; then
-        cp -rf "$TMPDIR/pkg/scripts/"* /data/harmony/ 2>/dev/null || true
-        chmod 755 /data/harmony/*.sh /data/harmony/rcS.local /data/harmony/dropbear* 2>/dev/null || true
-        if [ -f /data/harmony/rcS.local ]; then
-          cp -f /data/harmony/rcS.local /etc/init.d/rcS.local 2>/dev/null || true
-          chmod 755 /etc/init.d/rcS.local 2>/dev/null || true
-        fi
+      # Verified: prepare the flash (nothing is touched before this point)
+      mkdir -p /data/harmony/bin /cache/bin /cache/www 2>/dev/null
+      # Prune redundant/bloated binaries to ensure flash space
+      rm -f /cache/bin/hub_portal /cache/bin/hub_dhcpd /cache/bin/hub_sntp 2>/dev/null || true
+      echo "[*] Installing package files one at a time..."
+      if ! install_bundle "$TMPDIR/pkg"; then
+        rm -rf "$TMPDIR" 2>/dev/null
+        echo "[-] Software update stopped: a file could not be written to flash. Every file is whole, but some are new and some old. Version not changed: free space and run the update again."
+        return 1
       fi
+      INSTALL_OK=1
 
-      # CA Bundle -> /data/harmony/cacert.pem
-      if [ -f "$TMPDIR/pkg/config/cacert.pem" ]; then
-        cp -f "$TMPDIR/pkg/config/cacert.pem" /data/harmony/cacert.pem 2>/dev/null || true
-      elif [ -f "$TMPDIR/pkg/cacert.pem" ]; then
-        cp -f "$TMPDIR/pkg/cacert.pem" /data/harmony/cacert.pem 2>/dev/null || true
-      fi
-
-      # B. Application binaries -> /data/harmony/bin/
       if [ -f "$TMPDIR/pkg/bin/hub_util" ]; then
-        chmod 755 "$TMPDIR/pkg/bin/hub_util"
-        cp -f "$TMPDIR/pkg/bin/hub_util" "/data/harmony/bin/hub_util" 2>/dev/null || true
-        for _app in hub_sync sync mknod register_ehci eth_fix hub_dhcpd hub_portal hub_sntp; do
-          [ -f "/data/harmony/bin/$_app" ] && [ ! -L "/data/harmony/bin/$_app" ] && rm -f "/data/harmony/bin/$_app" 2>/dev/null || true
-          ln -sf /data/harmony/bin/hub_util "/data/harmony/bin/$_app" 2>/dev/null || true
-        done
+        link_hub_util
       fi
-      for b in hub_daemon hub_rf hub_btstack dropbearmulti hub_sync register_ehci eth_fix; do
-        if [ -f "$TMPDIR/pkg/bin/$b" ]; then
-          chmod 755 "$TMPDIR/pkg/bin/$b"
-          cp -f "$TMPDIR/pkg/bin/$b" "/data/harmony/bin/$b" 2>/dev/null || true
-          rm -f "/cache/bin/$b" 2>/dev/null || true
-        fi
+      for b in $BUNDLE_BINS; do
+        [ -f "$TMPDIR/pkg/bin/$b" ] && rm -f "/cache/bin/$b" 2>/dev/null
       done
-
-      # C. BusyBox -> /cache/bin/
-      if [ -f "$TMPDIR/pkg/bin/busybox" ]; then
-        chmod 755 "$TMPDIR/pkg/bin/busybox"
-        cp -f "$TMPDIR/pkg/bin/busybox" "/cache/bin/busybox" 2>/dev/null || true
-      fi
 
       # D. Install extended BusyBox applets strictly to /cache/bin (/bin/sh is NEVER touched)
       rm -f /data/bin/sh /data/bin/ash /data/bin/busybox 2>/dev/null || true
@@ -315,18 +372,21 @@ do_apply() {
         ln -sfn /cache/www /data/harmony/www 2>/dev/null || true
         rm -f /cache/www/assets/index-*.js* /cache/www/assets/web-*.js* 2>/dev/null || true
         rm -rf /cache/www/assets/icons 2>/dev/null || true
-        cp -rf "$TMPDIR/pkg/www/"* /cache/www/ 2>/dev/null || true
-        # Prune raw uncompressed assets where .gz exists to save flash
-        for f in /cache/www/assets/*.js /cache/www/assets/*.css /cache/www/index.html; do
-          [ -f "${f}.gz" ] && rm -f "$f" 2>/dev/null || true
-        done
-        rm -f /cache/www/assets/*.png.gz /cache/www/*.png.gz 2>/dev/null || true
-        echo "[+] WebUI bundle updated in /cache/www (raw files pruned, .gz preserved)."
+        if cp -rf "$TMPDIR/pkg/www/"* /cache/www/ 2>/dev/null; then
+          # Prune raw uncompressed assets where .gz exists to save flash
+          for f in /cache/www/assets/*.js /cache/www/assets/*.css /cache/www/index.html; do
+            [ -f "${f}.gz" ] && rm -f "$f" 2>/dev/null || true
+          done
+          rm -f /cache/www/assets/*.png.gz /cache/www/*.png.gz 2>/dev/null || true
+          echo "[+] WebUI bundle updated in /cache/www (raw files pruned, .gz preserved)."
+        else
+          echo "[-] WebUI bundle could not be copied to /cache/www (flash full?)."
+          INSTALL_OK=0
+        fi
       fi
 
-      # F. Icons archive -> /cache/icons.tar.gz
+      # F. Icons archive -> /cache/icons.tar.gz (staged above)
       if [ -f "$TMPDIR/pkg/icons.tar.gz" ]; then
-        cp -f "$TMPDIR/pkg/icons.tar.gz" /cache/icons.tar.gz 2>/dev/null || true
         rm -f /data/harmony/icons.tar.gz 2>/dev/null || true
         ln -sf /cache/icons.tar.gz /data/harmony/icons.tar.gz 2>/dev/null || true
         echo "[+] Icons archive updated in /cache/icons.tar.gz (symlinked)."
@@ -341,29 +401,63 @@ do_apply() {
   OTA_FALLBACK_OK=0
   if [ "$OTA_BUNDLE_OK" != "1" ]; then
     echo "[*] Falling back to modular asset download..."
+    FB_FILES=""
     if download_retry "${REPO}/www.tar.gz?_=${TIMESTAMP}" "$TMPDIR/www.tar.gz" 30 3; then
+      FB_FILES="$FB_FILES www.tar.gz=$TMPDIR/www.tar.gz"
+    fi
+    FB_BINS=""
+    FB_MISSING=""
+    for b in hub_util hub_daemon hub_rf hub_btstack register_ehci eth_fix hub_sync; do
+      if download_retry "${REPO}/bin/mips/${b}?_=${TIMESTAMP}" "$TMPDIR/$b" 30 3; then
+        FB_FILES="$FB_FILES bin/mips/$b=$TMPDIR/$b"
+        FB_BINS="$FB_BINS $b"
+      elif grep -q "\"bin/mips/$b\"" "$TMPDIR/manifest.json" 2>/dev/null; then
+        FB_MISSING="$FB_MISSING $b"
+      fi
+    done
+    # Every downloaded file must match the signed manifest before any of them is installed
+    # shellcheck disable=SC2086
+    if [ -z "$FB_FILES" ] || ! verify_files $FB_FILES; then
+      echo "[-] Downloaded files missing or not matching the signed manifest. Aborting update, nothing was changed."
+      rm -rf "$TMPDIR" 2>/dev/null
+      return 1
+    fi
+    # Every binary the release lists, and hub_daemon in any case, must be installed together
+    case " $FB_BINS " in *" hub_daemon "*) ;; *) FB_MISSING="$FB_MISSING hub_daemon" ;; esac
+    if [ -n "$FB_MISSING" ]; then
+      echo "[-] Could not download:$FB_MISSING. Aborting update, nothing was changed."
+      rm -rf "$TMPDIR" 2>/dev/null
+      return 1
+    fi
+    # Verified: prepare the flash (nothing is touched before this point)
+    mkdir -p /data/harmony/bin /cache/bin /cache/www 2>/dev/null
+    # Prune redundant/bloated binaries to ensure flash space
+    rm -f /cache/bin/hub_portal /cache/bin/hub_dhcpd /cache/bin/hub_sntp 2>/dev/null || true
+    for b in $FB_BINS; do
+      if ! install_file "$TMPDIR/$b" "/data/harmony/bin/$b" 755; then
+        rm -rf "$TMPDIR" 2>/dev/null
+        echo "[-] Software update stopped: a file could not be written to flash. Every file is whole, but some are new and some old. Version not changed: free space and run the update again."
+        return 1
+      fi
+    done
+    INSTALL_OK=1
+    for b in $FB_BINS; do
+      rm -f "/cache/bin/$b" 2>/dev/null || true
+    done
+    case " $FB_BINS " in *" hub_util "*) link_hub_util ;; esac
+    if [ -f "$TMPDIR/www.tar.gz" ]; then
       mkdir -p /cache/www 2>/dev/null
       [ -d /data/harmony/www ] && [ ! -L /data/harmony/www ] && rm -rf /data/harmony/www 2>/dev/null || true
       ln -sfn /cache/www /data/harmony/www 2>/dev/null || true
-      $TAR -xzf "$TMPDIR/www.tar.gz" -C /cache/www/ 2>/dev/null
-      rm -f "$TMPDIR/www.tar.gz"
-      echo "[+] WebUI bundle updated in /cache/www."
-    fi
-
-    for b in hub_util hub_daemon hub_rf hub_btstack register_ehci eth_fix hub_sync; do
-      if download_retry "${REPO}/bin/mips/${b}?_=${TIMESTAMP}" "$TMPDIR/$b" 30 3; then
-        chmod 755 "$TMPDIR/$b"
-        mv -f "$TMPDIR/$b" "/data/harmony/bin/$b"
-        rm -f "/cache/bin/$b" 2>/dev/null || true
-        [ "$b" = "hub_daemon" ] && OTA_FALLBACK_OK=1
-        if [ "$b" = "hub_util" ]; then
-          for _app in hub_sync sync mknod register_ehci eth_fix hub_dhcpd hub_portal hub_sntp; do
-            [ -f "/data/harmony/bin/$_app" ] && [ ! -L "/data/harmony/bin/$_app" ] && rm -f "/data/harmony/bin/$_app" 2>/dev/null || true
-            ln -sf /data/harmony/bin/hub_util "/data/harmony/bin/$_app" 2>/dev/null || true
-          done
-        fi
+      if $TAR -xzf "$TMPDIR/www.tar.gz" -C /cache/www/ 2>/dev/null; then
+        echo "[+] WebUI bundle updated in /cache/www."
+      else
+        echo "[-] WebUI bundle could not be unpacked to /cache/www (flash full?)."
+        INSTALL_OK=0
       fi
-    done
+      rm -f "$TMPDIR/www.tar.gz"
+    fi
+    OTA_FALLBACK_OK=1
   fi
 
   # 5. Check if update succeeded before recording version
@@ -371,9 +465,17 @@ do_apply() {
     echo "[-] Software update failed: could not download packages."
     return 1
   fi
+  if [ "$INSTALL_OK" != "1" ]; then
+    rm -rf "$TMPDIR" 2>/dev/null
+    echo "[-] Software update incomplete: the binaries were installed but not all files. Version not changed, run the update again."
+    return 1
+  fi
 
-  # 6. Record new version (Hub and remote version metadata)
-  echo "$NEW_VER" > /data/harmony/VERSION
+  # 6. Record new version (Hub and remote version metadata), only after a complete install
+  if ! { echo "$NEW_VER" > /data/harmony/VERSION.new && mv -f /data/harmony/VERSION.new /data/harmony/VERSION; }; then
+    rm -f /data/harmony/VERSION.new 2>/dev/null
+    echo "[-] Could not record version v${NEW_VER} in /data/harmony/VERSION."
+  fi
   echo "$NEW_VER" > /etc/harmony_version 2>/dev/null || true
   echo "$NEW_VER" > /data/harmony/latest_version
   echo "$NEW_VER" > /data/harmony/remote_ui.version 2>/dev/null || true
@@ -405,20 +507,22 @@ do_apply() {
 do_fetch_remote_ota() {
   local target="/tmp/remote_ui.ota.gz"
   local manifest="/tmp/remote_manifest.json"
+  local sig="/tmp/remote_manifest.json.sig"
   echo "[*] Downloading remote OTA package from ${REPO} to ${target}..."
-  rm -f "${target}" "${manifest}"
+  rm -f "${target}" "${manifest}" "${sig}"
 
-  # Fetch manifest with 1 attempt and short timeout (10s)
-  download_retry "${REPO}/manifest.json?_=${TIMESTAMP}" "${manifest}" 10 1 || true
-
-  # Fetch OTA image with 1 attempt and short timeout (20s)
-  if download_retry "${REPO}/bin/arm/remote_ui.ota.gz?_=${TIMESTAMP}" "${target}" 20 1 ||
-     download_retry "${REPO}/bin/arm/elite_ui.ota.gz?_=${TIMESTAMP}" "${target}" 20 1; then
-    echo "[+] Remote OTA package downloaded to ${target}."
-    return 0
+  # The image is kept only together with its manifest and signature: hub_rf verifies them before
+  # it sends anything to the remote, and treats an image without a manifest as staged by hand.
+  if download_retry "${REPO}/manifest.json?_=${TIMESTAMP}" "${manifest}" 10 1 &&
+     download_retry "${REPO}/manifest.json.sig?_=${TIMESTAMP}" "${sig}" 10 1; then
+    if download_retry "${REPO}/bin/arm/remote_ui.ota.gz?_=${TIMESTAMP}" "${target}" 20 1 ||
+       download_retry "${REPO}/bin/arm/elite_ui.ota.gz?_=${TIMESTAMP}" "${target}" 20 1; then
+      echo "[+] Remote OTA package downloaded to ${target}."
+      return 0
+    fi
   fi
-  echo "[-] Failed to download remote OTA package."
-  rm -f "${target}" "${manifest}"
+  echo "[-] Failed to download the remote OTA package with its signed manifest."
+  rm -f "${target}" "${manifest}" "${sig}"
   return 1
 }
 

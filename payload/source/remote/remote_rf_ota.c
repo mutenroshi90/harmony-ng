@@ -10,9 +10,12 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <fcntl.h>
 #include <sys/reboot.h>
 #include <time.h>
 #include <errno.h>
+#include <dirent.h>
 
 #define OTA_MAX_CHUNKS 65536 /* every 16-bit chunk index; OTA_START rejects larger images */
 #define OTA_BITMAP_SIZE (OTA_MAX_CHUNKS / 8)
@@ -243,6 +246,199 @@ void handle_ota_data_frame(const uint8_t *pkt) {
     ota_mark_progress_render();
 }
 
+/* Free space kept on /data besides the new binary when it is staged */
+#define OTA_INSTALL_FREE_MARGIN (64 * 1024)
+/* ACK status of OTA_END when the image was good but could not be installed (old binary kept) */
+#define OTA_STATUS_INSTALL_FAILED 0x07
+
+int ota_sync_file(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    int rc = fsync(fd);
+    close(fd);
+    return rc;
+}
+
+int ota_stage_file(const char *src, const char *dst, uint64_t free_margin) {
+    struct stat st;
+    if (stat(src, &st) != 0 || st.st_size <= 0) {
+        printf("[-] OTA install: cannot read %s\n", src);
+        return -1;
+    }
+    char dir[160];
+    snprintf(dir, sizeof(dir), "%s", dst);
+    char *slash = strrchr(dir, '/');
+    if (slash && slash != dir) *slash = '\0';
+    else snprintf(dir, sizeof(dir), "%s", slash ? "/" : ".");
+    struct statvfs vfs;
+    if (statvfs(dir, &vfs) == 0) {
+        uint64_t avail = (uint64_t)vfs.f_bavail * (uint64_t)vfs.f_frsize;
+        if (avail < (uint64_t)st.st_size + free_margin) {
+            printf("[-] OTA install: %llu bytes free in %s, %llu needed\n", (unsigned long long)avail, dir,
+                   (unsigned long long)st.st_size + (unsigned long long)free_margin);
+            return -1;
+        }
+    }
+
+    int in = open(src, O_RDONLY);
+    if (in < 0) return -1;
+    int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    if (out < 0) {
+        printf("[-] OTA install: cannot create %s: %s\n", dst, strerror(errno));
+        close(in);
+        return -1;
+    }
+    uint8_t buf[8192];
+    off_t total = 0;
+    int ok = 1;
+    for (;;) {
+        ssize_t n = read(in, buf, sizeof(buf));
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) { ok = 0; break; }
+        if (n == 0) break;
+        ssize_t off = 0;
+        while (off < n) {
+            ssize_t w = write(out, buf + off, (size_t)(n - off));
+            if (w < 0 && errno == EINTR) continue;
+            if (w <= 0) { ok = 0; break; }
+            off += w;
+            total += w;
+        }
+        if (!ok) break;
+    }
+    if (ok && fsync(out) != 0) ok = 0;
+    if (close(out) != 0) ok = 0;
+    close(in);
+    if (!ok || total != st.st_size) {
+        printf("[-] OTA install: copy to %s failed (%lld of %lld bytes): %s\n", dst, (long long)total,
+               (long long)st.st_size, strerror(errno));
+        unlink(dst);
+        return -1;
+    }
+    chmod(dst, 0755);
+    return 0;
+}
+
+int ota_replace_file(const char *new_path, const char *path, const char *bak_path) {
+    if (bak_path && access(path, F_OK) == 0) {
+        /* The backup is a second name of the current file: no copy, no extra space */
+        unlink(bak_path);
+        if (link(path, bak_path) != 0) {
+            /* A file system without hard links (or a union mount refusing them): copy as before */
+            printf("[!] OTA install: hard link %s -> %s failed (%s), copying\n", path, bak_path, strerror(errno));
+            char cmd[400];
+            snprintf(cmd, sizeof(cmd), "cp -f '%s' '%s' 2>/dev/null", path, bak_path);
+            if (system(cmd) != 0) printf("[!] OTA install: no backup of %s\n", path);
+        }
+    }
+    /* Same file system: path is the old file or the complete new one, never a part of it */
+    if (rename(new_path, path) != 0) {
+        printf("[-] OTA install: rename %s -> %s failed: %s\n", new_path, path, strerror(errno));
+        return -1;
+    }
+    char dir[160];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash && slash != dir) {
+        *slash = '\0';
+        ota_sync_file(dir); /* the rename itself on flash */
+    }
+    return 0;
+}
+
+int ota_install_binary(const char *new_path, const char *path, const char *bak_path, const char *self_exe) {
+    /* The previous version is started by the supervisor when the installed one keeps failing.
+     * If that previous version is what runs now, the installed binary is the failing one: keep
+     * the backup instead of replacing it with it. Decided from the running file itself (same
+     * inode), whatever name or link it was started through. */
+    struct stat run_st, bak_st;
+    if (bak_path && self_exe && stat(self_exe, &run_st) == 0 && stat(bak_path, &bak_st) == 0 &&
+        run_st.st_dev == bak_st.st_dev && run_st.st_ino == bak_st.st_ino) {
+        printf("[*] OTA install: running the backup %s, it is kept (the replaced %s is not backed up)\n",
+               bak_path, path);
+        bak_path = NULL;
+    }
+    return ota_replace_file(new_path, path, bak_path);
+}
+
+static int ota_file_add(ota_file_t *files, int max, int n, const char *src, const char *dir, const char *name) {
+    if (n < 0 || n >= max) return -1;
+    if (snprintf(files[n].src, sizeof(files[n].src), "%s", src) >= (int)sizeof(files[n].src) ||
+        snprintf(files[n].dst, sizeof(files[n].dst), "%s/%s", dir, name) >= (int)sizeof(files[n].dst)) {
+        printf("[-] OTA install: path too long for %s\n", name);
+        return -1;
+    }
+    return n + 1;
+}
+
+int ota_package_files(const char *pkg_dir, const char *data_dir, const char *initd_dir, ota_file_t *files, int max) {
+    char src[OTA_PATH_MAX];
+    int n = 0;
+    snprintf(src, sizeof(src), "%s/rcS.local", pkg_dir);
+    if (access(src, F_OK) == 0) {
+        n = ota_file_add(files, max, n, src, initd_dir, "rcS.local");
+        n = ota_file_add(files, max, n, src, data_dir, "rcS.local");
+    }
+    DIR *d = opendir(pkg_dir);
+    if (!d) return -1;
+    struct dirent *e;
+    while (n >= 0 && (e = readdir(d)) != NULL) {
+        size_t len = strlen(e->d_name);
+        if (len <= 3 || e->d_name[0] == '.' || strcmp(e->d_name + len - 3, ".sh") != 0) continue;
+        if (snprintf(src, sizeof(src), "%s/%s", pkg_dir, e->d_name) >= (int)sizeof(src)) { n = -1; break; }
+        struct stat st;
+        if (stat(src, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        n = ota_file_add(files, max, n, src, data_dir, e->d_name);
+    }
+    closedir(d);
+    snprintf(src, sizeof(src), "%s/remote_sync", pkg_dir);
+    if (n >= 0 && access(src, F_OK) == 0) n = ota_file_add(files, max, n, src, data_dir, "remote_sync");
+    return n;
+}
+
+static void ota_drop_staged(const ota_file_t *files, int from, int to) {
+    char neu[OTA_PATH_MAX + 8];
+    for (int i = from; i < to; i++) {
+        snprintf(neu, sizeof(neu), "%s.new", files[i].dst);
+        unlink(neu);
+    }
+}
+
+int ota_stage_files(const ota_file_t *files, int n, uint64_t free_margin) {
+    char neu[OTA_PATH_MAX + 8];
+    for (int i = 0; i < n; i++) {
+        snprintf(neu, sizeof(neu), "%s.new", files[i].dst);
+        if (ota_stage_file(files[i].src, neu, free_margin) != 0) {
+            ota_drop_staged(files, 0, i);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int ota_commit_files(const ota_file_t *files, int n) {
+    char neu[OTA_PATH_MAX + 8], bak[OTA_PATH_MAX + 8];
+    for (int i = 0; i < n; i++) {
+        snprintf(neu, sizeof(neu), "%s.new", files[i].dst);
+        snprintf(bak, sizeof(bak), "%s.bak", files[i].dst);
+        if (ota_replace_file(neu, files[i].dst, bak) != 0) {
+            ota_drop_staged(files, i, n);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void ota_install_failed(uint8_t seq) {
+    printf("[-] OTA install failed: the current binary is kept\n");
+    system("rm -rf /tmp/remote_ota_pkg /data/remote_ui.new /tmp/remote_ui.ota.gz 2>/dev/null || true");
+    rf_frame_t ack;
+    rf_build_ack(&ack, g_remote_slot, seq, OTA_STATUS_INSTALL_FAILED);
+    rf_send_frame(&ack);
+    ota_set_updating(false);
+    g_screen_dirty = true;
+}
+
 bool handle_ota_frame(const rf_frame_t *f) {
     switch (f->msg_type) {
         case RF_MSG_OTA_START: {
@@ -467,34 +663,43 @@ bool handle_ota_frame(const rf_frame_t *f) {
 
             rf_frame_t ack;
             if (valid_elf) {
+                /* The new binary is written to /data first, next to its target, and checked: the
+                 * switch below is then a single rename, so /data/remote_ui is always the old
+                 * binary or the whole new one, and a copy that fails (no space left) keeps the old
+                 * one in place and tells the Hub */
+                int staged = is_pkg ? ota_stage_file(bin_path, "/data/remote_ui.new", OTA_INSTALL_FREE_MARGIN)
+                                    : ota_sync_file("/data/remote_ui.new");
+                /* The boot hook, the scripts and remote_sync of a package are staged the same way,
+                 * each as <target>.new next to its target, before any of them replaces a file: a
+                 * copy that fails leaves every installed file as it was */
+                ota_file_t pkg_files[OTA_MAX_PKG_FILES];
+                int pkg_count = is_pkg ? ota_package_files("/tmp/remote_ota_pkg", "/data", "/etc/init.d",
+                                                           pkg_files, OTA_MAX_PKG_FILES) : 0;
+                if (staged == 0 && pkg_count < 0) {
+                    printf("[-] OTA install: cannot list the files of the package\n");
+                    staged = -1;
+                }
+                if (staged == 0 && pkg_count > 0 && ota_stage_files(pkg_files, pkg_count, OTA_INSTALL_FREE_MARGIN) != 0)
+                    staged = -1;
+                if (staged != 0) {
+                    ota_install_failed(f->seq);
+                    return true;
+                }
                 printf("[+] ELF header verified! Replacing binary and installing scripts...\n");
-                system("cp -f /data/remote_ui /data/remote_ui.bak 2>/dev/null");
 
                 if (is_pkg) {
-                    if (access("/tmp/remote_ota_pkg/rcS.local", F_OK) == 0) {
-                        system("cp -f /tmp/remote_ota_pkg/rcS.local /etc/init.d/rcS.local && chmod 755 /etc/init.d/rcS.local");
-                        system("cp -f /tmp/remote_ota_pkg/rcS.local /data/rcS.local 2>/dev/null && chmod 755 /data/rcS.local 2>/dev/null || true");
-                    }
-                    if (access("/tmp/remote_ota_pkg/remote_watchdog.sh", F_OK) == 0) {
-                        system("cp -f /tmp/remote_ota_pkg/remote_watchdog.sh /data/remote_watchdog.sh && chmod 755 /data/remote_watchdog.sh");
-                    }
-                    if (access("/tmp/remote_ota_pkg/factory_reset.sh", F_OK) == 0) {
-                        system("cp -f /tmp/remote_ota_pkg/factory_reset.sh /data/factory_reset.sh && chmod 755 /data/factory_reset.sh");
-                    }
-                    system("for s in /tmp/remote_ota_pkg/*.sh; do [ -f \"$s\" ] && cp -f \"$s\" /data/ && chmod 755 \"/data/${s##*/}\"; done 2>/dev/null || true");
                     /* Built-in themes replace their older versions; other themes stay.
                        No basename: the stock BusyBox has none, and an empty name made
                        older builds wipe /data/themes and leave the last theme's files
                        at its top level; those stray files are removed here. */
                     system("mkdir -p /data/themes && rm -f /data/themes/* 2>/dev/null; for t in /tmp/remote_ota_pkg/themes/*; do [ -d \"$t\" ] && rm -rf \"/data/themes/${t##*/}\" && cp -r \"$t\" /data/themes/; done 2>/dev/null || true");
-                    if (access("/tmp/remote_ota_pkg/remote_sync", F_OK) == 0) {
-                        system("cp -f /tmp/remote_ota_pkg/remote_sync /data/remote_sync && chmod 755 /data/remote_sync");
-                    }
-                    char cp_cmd[384];
-                    snprintf(cp_cmd, sizeof(cp_cmd), "mv -f %s /data/remote_ui && chmod 755 /data/remote_ui", bin_path);
-                    system(cp_cmd);
-                } else {
-                    system("mv -f /data/remote_ui.new /data/remote_ui && chmod 755 /data/remote_ui");
+                }
+                /* One rename per file, the previous version kept as <target>.bak. A script that
+                 * is running (init.sh) keeps reading its old copy. */
+                if (ota_commit_files(pkg_files, pkg_count) != 0 ||
+                    ota_install_binary("/data/remote_ui.new", "/data/remote_ui", "/data/remote_ui.bak", "/proc/self/exe") != 0) {
+                    ota_install_failed(f->seq);
+                    return true;
                 }
 
                 system("rm -rf /tmp/remote_ota_pkg /tmp/remote_ui.ota.gz /data/remote_ui.new 2>/dev/null || true");
@@ -550,14 +755,81 @@ bool handle_ota_frame(const rf_frame_t *f) {
     }
 }
 
+#define ICON_RX_TMP "/tmp/custom_icon_rx.tmp"
+
+static void icon_rx_drop(void) {
+    if (g_icon_rx_file) {
+        fclose(g_icon_rx_file);
+        g_icon_rx_file = NULL;
+    }
+    unlink(ICON_RX_TMP);
+    g_icon_rx_id[0] = '\0';
+    g_icon_rx_bytes = 0;
+    g_icon_rx_chunks = 0;
+}
+
+/* Copy src to dst through a temporary file in dst's directory and rename(): no shell, and
+ * dst is either the old file or the complete new one. */
+static int icon_install(const char *src, const char *dst) {
+    char tmp[160];
+    if (snprintf(tmp, sizeof(tmp), "%s.tmp", dst) >= (int)sizeof(tmp)) return -1;
+    int in = open(src, O_RDONLY);
+    if (in < 0) return -1;
+    int out = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (out < 0) {
+        close(in);
+        return -1;
+    }
+    char buf[1024];
+    ssize_t r;
+    int rc = 0;
+    while (rc == 0 && (r = read(in, buf, sizeof(buf))) != 0) {
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            rc = -1;
+            break;
+        }
+        for (ssize_t off = 0; off < r;) {
+            ssize_t w = write(out, buf + off, (size_t)(r - off));
+            if (w < 0 && errno == EINTR) continue;
+            if (w <= 0) {
+                rc = -1;
+                break;
+            }
+            off += w;
+        }
+    }
+    if (rc == 0 && fsync(out) != 0) rc = -1;
+    if (close(out) != 0) rc = -1;
+    close(in);
+    if (rc == 0 && rename(tmp, dst) != 0) rc = -1;
+    if (rc != 0) unlink(tmp);
+    return rc;
+}
+
 bool handle_icon_frame(const rf_frame_t *f) {
     switch (f->msg_type) {
         case RF_MSG_ICON_START: {
+            /* The id ends at a zero byte inside payload[5..24] and must pass rf_icon_id_valid():
+             * it becomes part of file names below. Anything else ends the transfer. */
+            const uint8_t *id_raw = &f->payload[5];
+            const uint8_t *id_end = memchr(id_raw, 0, sizeof(f->payload) - 5);
+            char id[RF_ICON_ID_MAX + 1] = {0};
+            if (id_end && (size_t)(id_end - id_raw) <= RF_ICON_ID_MAX) memcpy(id, id_raw, (size_t)(id_end - id_raw));
+            if (!id_end || !rf_icon_id_valid(id)) {
+                printf("[-] Remote RF ICON_START: icon id refused (only A-Z a-z 0-9 _ -, 1..%d characters)\n",
+                       RF_ICON_ID_MAX);
+                icon_rx_drop();
+                rf_frame_t ack;
+                rf_build_ack(&ack, g_remote_slot, f->seq, RF_ICON_STATUS_BAD_ID);
+                rf_send_frame(&ack);
+                return true;
+            }
             g_icon_rx_type = f->payload[0];
             g_icon_rx_tot_bytes = (uint32_t)f->payload[1] | ((uint32_t)f->payload[2] << 8);
             uint16_t tot_c = (uint16_t)f->payload[3] | ((uint16_t)f->payload[4] << 8);
             memset(g_icon_rx_id, 0, sizeof(g_icon_rx_id));
-            strncpy(g_icon_rx_id, (const char *)&f->payload[5], sizeof(g_icon_rx_id) - 1);
+            memcpy(g_icon_rx_id, id, strlen(id));
             g_icon_rx_bytes = 0;
             g_icon_rx_chunks = 0;
 
@@ -580,7 +852,7 @@ bool handle_icon_frame(const rf_frame_t *f) {
                 fclose(g_icon_rx_file);
                 g_icon_rx_file = NULL;
             }
-            g_icon_rx_file = fopen("/tmp/custom_icon_rx.tmp", "wb");
+            g_icon_rx_file = fopen(ICON_RX_TMP, "wb");
             rf_frame_t ack;
             rf_build_ack(&ack, g_remote_slot, f->seq, g_icon_rx_file ? RF_ICON_STATUS_OK : 0x03);
             rf_send_frame(&ack);
@@ -593,6 +865,11 @@ bool handle_icon_frame(const rf_frame_t *f) {
             uint8_t d_len = f->payload[2];
             if (d_len > 22) d_len = 22;
 
+            if (g_icon_rx_bytes + d_len > RF_ICON_MAX_BYTES) {
+                printf("[-] Remote RF ICON_CHUNK: icon larger than %d bytes, transfer dropped\n", RF_ICON_MAX_BYTES);
+                icon_rx_drop();
+                return true;
+            }
             if (d_len > 0) {
                 fwrite(&f->payload[3], 1, d_len, g_icon_rx_file);
                 g_icon_rx_bytes += d_len;
@@ -615,13 +892,13 @@ bool handle_icon_frame(const rf_frame_t *f) {
             uint16_t expected_crc = (uint16_t)f->payload[0] | ((uint16_t)f->payload[1] << 8);
 
             /* Verify file integrity via CRC16 */
-            FILE *v = fopen("/tmp/custom_icon_rx.tmp", "rb");
+            FILE *v = fopen(ICON_RX_TMP, "rb");
             uint8_t ack_status = 0x01;
             if (v) {
                 fseek(v, 0, SEEK_END);
                 long sz = ftell(v);
                 fseek(v, 0, SEEK_SET);
-                if (sz > 0 && sz <= 16384) {
+                if (sz > 0 && sz <= RF_ICON_MAX_BYTES) {
                     uint8_t *tmp_buf = (uint8_t *)malloc((size_t)sz);
                     if (tmp_buf) {
                         if (fread(tmp_buf, 1, (size_t)sz, v) == (size_t)sz) {
@@ -639,27 +916,32 @@ bool handle_icon_frame(const rf_frame_t *f) {
                 fclose(v);
             }
 
+            const char *t_prefix = (g_icon_rx_type == 1) ? "device" : (g_icon_rx_type == 2 ? "button" : "activity");
+            char dst_path[128], plain_path[128];
+            snprintf(dst_path, sizeof(dst_path), "/data/assets/custom/%s_%s.png", t_prefix, g_icon_rx_id);
+            snprintf(plain_path, sizeof(plain_path), "/data/assets/custom/%s.png", g_icon_rx_id);
             if (ack_status == 0x00) {
                 mkdir("/data/assets", 0755);
                 mkdir("/data/assets/custom", 0755);
-                const char *t_prefix = (g_icon_rx_type == 1) ? "device" : (g_icon_rx_type == 2 ? "button" : "activity");
-                char dst_path[128];
-                snprintf(dst_path, sizeof(dst_path), "/data/assets/custom/%s_%s.png", t_prefix, g_icon_rx_id);
+                if (icon_install(ICON_RX_TMP, dst_path) != 0 || icon_install(ICON_RX_TMP, plain_path) != 0) {
+                    printf("[-] Custom icon %s could not be saved: %s\n", g_icon_rx_id, strerror(errno));
+                    ack_status = 0x03;
+                }
+            }
+            unlink(ICON_RX_TMP);
 
-                char cmd[300];
-                snprintf(cmd, sizeof(cmd), "cp -f /tmp/custom_icon_rx.tmp %s && cp -f /tmp/custom_icon_rx.tmp /data/assets/custom/%s.png",
-                         dst_path, g_icon_rx_id);
-                system(cmd);
-                unlink("/tmp/custom_icon_rx.tmp");
-
+            if (ack_status == 0x00) {
                 fb_invalidate_png_cache(g_icon_rx_id);
 
+                /* An icon also belongs to the activities whose custom icon number it is, but only
+                 * when the id is a number: atoi() of a name is 0, the icon number of activities
+                 * without a custom icon. */
+                uint16_t icon_num = 0;
+                if (strspn(g_icon_rx_id, "0123456789") == strlen(g_icon_rx_id)) icon_num = (uint16_t)atoi(g_icon_rx_id);
                 for (int i = 0; i < g_activity_count; i++) {
                     if (strcmp(g_activities[i].id, g_icon_rx_id) == 0 ||
-                        (i < g_rf_activity_count && g_rf_activities[i].icon_id == (uint16_t)atoi(g_icon_rx_id))) {
-                        char cpath[128];
-                        snprintf(cpath, sizeof(cpath), "/data/assets/custom/%s.png", g_icon_rx_id);
-                        copy_str(g_activities[i].icon_path, sizeof(g_activities[i].icon_path), cpath);
+                        (icon_num != 0 && i < g_rf_activity_count && g_rf_activities[i].icon_id == icon_num)) {
+                        copy_str(g_activities[i].icon_path, sizeof(g_activities[i].icon_path), plain_path);
                     }
                 }
                 g_screen_dirty = true;
