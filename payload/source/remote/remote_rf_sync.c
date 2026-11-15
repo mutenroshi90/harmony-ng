@@ -293,7 +293,8 @@ void handle_hub_frame_remote(const rf_frame_t *f) {
         }
 
         case RF_MSG_NAME_TAIL_CHUNK: {
-            /* [0] 0 = activity, 1 = device, [1] index, [2] offset in the name, [3..24] name bytes */
+            /* [0] 0 = activity, 1 = device, 2 = on-screen button label, [1] index, [2] offset in
+               the name, [3..24] name bytes */
             sync_touch_chunk();
             char *name = NULL;
             size_t size = 0;
@@ -303,6 +304,9 @@ void handle_hub_frame_remote(const rf_frame_t *f) {
             } else if (f->payload[0] == 1 && f->payload[1] < MAX_RF_DEVICES) {
                 name = g_rf_devices[f->payload[1]].name;
                 size = sizeof(g_rf_devices[0].name);
+            } else if (f->payload[0] == 2 && f->payload[1] < MAX_RF_BUTTONS) {
+                name = g_rf_buttons[f->payload[1]].label;
+                size = sizeof(g_rf_buttons[0].label);
             }
             if (name) {
                 size_t off = f->payload[2];

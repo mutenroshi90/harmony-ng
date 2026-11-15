@@ -19,7 +19,7 @@ static void draw_row_label(int text_x, int y, int row_h, const char *label, uint
 }
 
 void execute_active_dev_cmd(int filtered_idx) {
-    char label[32] = {0};
+    char label[sizeof(g_rf_buttons[0].label)] = {0};
     uint8_t btn_idx = 0, atype = 1;
     if (get_active_dev_cmd_item(filtered_idx, label, sizeof(label), &btn_idx, &atype, NULL, 0) == 0) {
         if (atype == 2) {
@@ -112,7 +112,7 @@ void render_devices_screen(void) {
             int x = 8 + s_grid_col[idx] * (half_w + DEV_GRID_GAP);
             bool is_sel = (idx == g_selected_device_cmd);
 
-            char label[32] = {0};
+            char label[sizeof(g_rf_buttons[0].label)] = {0};
             uint8_t bidx = 0, atype = 1;
             get_active_dev_cmd_item(idx, label, sizeof(label), &bidx, &atype, NULL, 0);
 
@@ -140,7 +140,7 @@ void render_devices_screen(void) {
         uint16_t bg = is_sel ? RGB_CARD_SEL : RGB_CARD;
         uint16_t border = is_sel ? RGB_TEAL : g_theme.pal.outline;
 
-        char label[32] = {0};
+        char label[sizeof(g_rf_buttons[0].label)] = {0};
         char icon_key[24] = {0};
         uint8_t bidx = 0, atype = 1;
         get_active_dev_cmd_item(idx, label, sizeof(label), &bidx, &atype, icon_key, sizeof(icon_key));

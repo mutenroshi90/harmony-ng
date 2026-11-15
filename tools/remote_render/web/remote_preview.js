@@ -99,7 +99,7 @@ export function writeRemoteConfig(module, { activities = [], devices = [], remot
       for (const b of screenButtons) {
         if (buttons.length >= 48) break;
         if (!b || typeof b !== 'object') continue;
-        buttons.push({ ctx: ctx.slice(0, 9), label: String(b.label || 'Button').slice(0, 12), ctype: 1, atype: 1, bidx: i++, ...(b.wide ? { wide: 1 } : {}) });
+        buttons.push({ ctx: ctx.slice(0, 9), label: String(b.label || 'Button').slice(0, 32), ctype: 1, atype: 1, bidx: i++, ...(b.wide ? { wide: 1 } : {}) });
       }
       continue;
     }

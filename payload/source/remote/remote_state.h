@@ -152,7 +152,7 @@ typedef struct {
 
 typedef struct {
     char context_id[13];  /* activity context ID, e.g. "53591842" or "-1" */
-    char label[16];       /* short button label */
+    char label[33];       /* button label, RF_BTN_LABEL_SIZE: 12 bytes in the button chunk, the rest in name tail chunks */
     uint8_t context_type; /* 0=physical, 1=screen/dev button */
     uint8_t wide;         /* on-screen button across the whole row in two columns (RF_BTN_FLAG_WIDE) */
     uint8_t action_type;  /* 1=device_cmd, 2=activity_start, 3=activity_stop */

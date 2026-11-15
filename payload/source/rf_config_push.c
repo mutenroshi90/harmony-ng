@@ -25,8 +25,9 @@ static bool send_as_custom_icon(const char *name) {
     return !rf_activity_icon_match(name) && custom_icon_registry_has_file(name);
 }
 
-/* Queue the part of an activity (kind 0) or device (kind 1) name that did not fit in its
-   list chunk, 22 bytes per frame, for remotes that report RF_CAP_LONG_NAMES */
+/* Queue the part of an activity (kind 0) or device (kind 1) name, or of an on-screen button
+   label (kind 2, idx = the button's list position), that did not fit in its list chunk,
+   22 bytes per frame, for remotes that report RF_CAP_LONG_NAMES */
 static void queue_name_tail(push_queue_t *q, uint8_t slot, uint8_t kind, int idx, const char *name, size_t sent) {
     if (slot < 1 || slot > 2 || !(g_remote_versions[slot - 1].caps & RF_CAP_LONG_NAMES)) return;
     for (size_t off = sent; off < strlen(name); off += 22) {
@@ -509,6 +510,7 @@ void *config_push_worker(void *arg) {
 
                             rf_build_frame(&f, target_slot, RF_MSG_BUTTON_LIST_CHUNK, ++g_tx_seq, RF_FLAG_ACK_REQ, payload, 25);
                             push_queue_add(&queue[t], &f);
+                            queue_name_tail(&queue[t], target_slot, 2, btn_count, label, 12);
                             btn_count++;
                             sidx++;
                         }
@@ -539,6 +541,7 @@ void *config_push_worker(void *arg) {
 
                 rf_build_frame(&f, target_slot, RF_MSG_BUTTON_LIST_CHUNK, ++g_tx_seq, RF_FLAG_ACK_REQ, payload, 25);
                 push_queue_add(&queue[t], &f);
+                queue_name_tail(&queue[t], target_slot, 2, btn_count, entries[i].label, 12);
                 btn_count++;
             }
             free(entries);

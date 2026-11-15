@@ -714,8 +714,8 @@ void load_rf_config(void) {
             if (jctx && jlbl && cJSON_IsString(jctx) && cJSON_IsString(jlbl)) {
                 strncpy(g_rf_buttons[g_rf_button_count].context_id, jctx->valuestring, 12);
                 g_rf_buttons[g_rf_button_count].context_id[12] = '\0';
-                strncpy(g_rf_buttons[g_rf_button_count].label, jlbl->valuestring, 15);
-                g_rf_buttons[g_rf_button_count].label[15] = '\0';
+                strncpy(g_rf_buttons[g_rf_button_count].label, jlbl->valuestring, sizeof(g_rf_buttons[0].label) - 1);
+                g_rf_buttons[g_rf_button_count].label[sizeof(g_rf_buttons[0].label) - 1] = '\0';
                 g_rf_buttons[g_rf_button_count].context_type = jctype ? (uint8_t)jctype->valueint : 0;
                 cJSON *jwide = cJSON_GetObjectItem(b, "wide");
                 g_rf_buttons[g_rf_button_count].wide = (jwide && cJSON_IsNumber(jwide) && jwide->valueint) ? 1 : 0;

@@ -138,6 +138,9 @@
 
 /* Activity and device names, including the NUL, on remotes that report RF_CAP_LONG_NAMES */
 #define RF_NAME_SIZE               40
+/* On-screen button labels, including the NUL: the button chunk carries 12 bytes, the rest
+   follows in RF_MSG_NAME_TAIL_CHUNK kind 2 (the web UI allows 32 characters) */
+#define RF_BTN_LABEL_SIZE          33
 
 /* Flags */
 #define RF_FLAG_ACK_REQ  0x01

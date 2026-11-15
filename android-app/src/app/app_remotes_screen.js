@@ -55,7 +55,7 @@ import {
 import { HarmonyAppRemotesB25 } from './app_remotes_b25.js';
 
 // Names the build of the screen renderer in public/assets; change it whenever that build changes
-const REMOTE_PREVIEW_BUILD = "2.4.2-devorder1";
+const REMOTE_PREVIEW_BUILD = "2.4.2-labels1";
 
 export class HarmonyAppRemotesScreen extends HarmonyAppRemotesB25 {
   async loadRemoteView() {
