@@ -66,11 +66,26 @@ export function writeRemoteConfig(module, { activities = [], devices = [], remot
     const name = String(d.name || d.Name);
     const stored = name.slice(0, 16);
     const type = d.type || d.Type || d.deviceType || d.DeviceTypeDisplayName;
+    // Touch buttons edited in the web UI replace the full command list, as in rf_config_push.c:
+    // their order and labels, without deleted or unknown commands, one row per command
+    const allCmds = (d.commands || []).slice(0, 255).map((c) => String(typeof c === 'string' ? c : c.name || ''));
+    const sbtns = remoteMap?.devices?.[String(d.id)]?.screen_buttons;
+    let commands = allCmds;
+    if (Array.isArray(sbtns)) {
+      const seen = new Set();
+      commands = [];
+      for (const b of sbtns) {
+        const idx = allCmds.indexOf(String(b?.command ?? ''));
+        if (idx < 0 || seen.has(idx) || commands.length >= 255) continue;
+        seen.add(idx);
+        commands.push(String(b.label || b.command));
+      }
+    }
     return {
       id: String(d.id).slice(0, 4),
       name: name.slice(0, 39),
       ...iconFields(d.icon || d.Icon, name, type, stored),
-      commands: (d.commands || []).slice(0, 255).map((c) => String(typeof c === 'string' ? c : c.name || '').slice(0, 22)),
+      commands: commands.map((c) => c.slice(0, 22)),
     };
   });
 

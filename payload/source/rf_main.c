@@ -24,8 +24,9 @@
 
 /* RF_MSG_DEVICE_CMD_INDEX payload: [0..9] device id, [10] command index, [11..24] name prefix.
    The index comes from the last config push; the name prefix guards against devices.json
-   having changed since then. */
-static void enqueue_browsed_device_cmd(const uint8_t *payload) {
+   having changed since then. A touch button renamed in the web UI shows its label instead, so
+   the command at the index is also accepted while the slot map still lists it for the device. */
+static void enqueue_browsed_device_cmd(uint8_t slot, const uint8_t *payload) {
     char dev_id[8] = {0};
     char prefix[22] = {0};
     memcpy(dev_id, payload, 4);
@@ -34,6 +35,7 @@ static void enqueue_browsed_device_cmd(const uint8_t *payload) {
 
     char matched_full_id[64] = {0};
     char matched_cmd_name[64] = {0};
+    char idx_cmd_name[64] = {0};
     int found = 0;
 
     rf_devices_cache_lock();
@@ -51,14 +53,16 @@ static void enqueue_browsed_device_cmd(const uint8_t *payload) {
             cJSON *cmd = NULL;
             cJSON_ArrayForEach(cmd, cmds) {
                 cJSON *jn = cJSON_IsString(cmd) ? cmd : cJSON_GetObjectItem(cmd, "name");
+                if (c == cmd_idx && jn && cJSON_IsString(jn))
+                    strncpy(idx_cmd_name, jn->valuestring, sizeof(idx_cmd_name) - 1);
                 if (jn && cJSON_IsString(jn) && strncmp(jn->valuestring, prefix, 20) == 0) {
                     if (c == cmd_idx) { cmd_name = jn->valuestring; break; }
                     if (!cmd_name) cmd_name = jn->valuestring; /* index moved: first name match */
                 }
                 c++;
             }
-            if (full_id && cmd_name) {
-                strncpy(matched_full_id, full_id, sizeof(matched_full_id) - 1);
+            strncpy(matched_full_id, full_id, sizeof(matched_full_id) - 1);
+            if (cmd_name) {
                 strncpy(matched_cmd_name, cmd_name, sizeof(matched_cmd_name) - 1);
                 found = 1;
             }
@@ -66,6 +70,12 @@ static void enqueue_browsed_device_cmd(const uint8_t *payload) {
         }
     }
     rf_devices_cache_unlock();
+
+    if (!found && matched_full_id[0] && idx_cmd_name[0] &&
+        device_screen_button_has_cmd(slot, matched_full_id, idx_cmd_name)) {
+        strncpy(matched_cmd_name, idx_cmd_name, sizeof(matched_cmd_name) - 1);
+        found = 1;
+    }
 
     if (found) {
         printf("[*] Device browser command: dev=%s idx=%d -> %s\n", matched_full_id, cmd_idx, matched_cmd_name);
@@ -137,7 +147,7 @@ void handle_rf_frame(const rf_frame_t *f) {
         }
 
         case RF_MSG_DEVICE_CMD_INDEX:
-            enqueue_browsed_device_cmd(f->payload);
+            enqueue_browsed_device_cmd((f->dev_slot & 0x0F) == 2 ? 2 : 1, f->payload);
             break;
 
         case RF_MSG_HELP_REQUEST:

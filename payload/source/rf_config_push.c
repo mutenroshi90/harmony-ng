@@ -41,6 +41,82 @@ static void queue_name_tail(push_queue_t *q, uint8_t slot, uint8_t kind, int idx
     }
 }
 
+/* Index of the command called name in a device's "commands" array, or -1 */
+static int device_cmd_index(const cJSON *cmds, const char *name) {
+    int c = 0;
+    const cJSON *cmd = NULL;
+    cJSON_ArrayForEach(cmd, cmds) {
+        const cJSON *jn = cJSON_IsString(cmd) ? cmd : cJSON_GetObjectItem(cmd, "name");
+        if (jn && cJSON_IsString(jn) && strcmp(jn->valuestring, name) == 0) return c;
+        c++;
+    }
+    return -1;
+}
+
+/* Queue a device's touch buttons as edited in the web UI ("devices" -> id -> "screen_buttons" in
+   the slot map): their order and labels, without the deleted ones. Each chunk keeps the
+   command's index in devices.json, which the remote sends back when the button is pressed.
+   Returns false when the device has no edited list, so all its commands are sent instead. */
+static bool push_device_screen_buttons(rf_frame_t *f, push_queue_t *q, uint8_t slot, int dev_idx,
+                                       const char *dev_id, const cJSON *cmds) {
+    bool used = false;
+    pthread_mutex_lock(&g_map_lock);
+    cJSON *map = get_remote_map_unlocked(slot);
+    cJSON *mdevs = map ? cJSON_GetObjectItemCaseSensitive(map, "devices") : NULL;
+    cJSON *mdev = mdevs ? cJSON_GetObjectItemCaseSensitive(mdevs, dev_id) : NULL;
+    cJSON *sbtns = mdev ? cJSON_GetObjectItemCaseSensitive(mdev, "screen_buttons") : NULL;
+    if (cJSON_IsArray(sbtns)) {
+        used = true;
+        int idx[255];
+        const char *text[255];
+        int total = 0;
+        cJSON *b = NULL;
+        cJSON_ArrayForEach(b, sbtns) {
+            if (total >= 255) break;
+            cJSON *jcmd = cJSON_GetObjectItemCaseSensitive(b, "command");
+            if (!cJSON_IsString(jcmd)) continue;
+            int c = device_cmd_index(cmds, jcmd->valuestring);
+            if (c < 0 || c > 255) continue;
+            /* the remote keeps one row per command index */
+            int dup = 0;
+            for (int k = 0; k < total && !dup; k++) dup = (idx[k] == c);
+            if (dup) continue;
+            cJSON *jlabel = cJSON_GetObjectItemCaseSensitive(b, "label");
+            idx[total] = c;
+            text[total] = (cJSON_IsString(jlabel) && jlabel->valuestring[0]) ? jlabel->valuestring : jcmd->valuestring;
+            total++;
+        }
+        for (int k = 0; k < total; k++) {
+            uint8_t payload[25] = {0};
+            payload[0] = (uint8_t)dev_idx;
+            payload[1] = (uint8_t)idx[k];
+            payload[2] = (uint8_t)total;
+            strncpy((char *)&payload[3], text[k], 22);
+            rf_build_frame(f, slot, RF_MSG_DEVICE_CMD_CHUNK, ++g_tx_seq, RF_FLAG_ACK_REQ, payload, 25);
+            push_queue_add(q, f);
+        }
+    }
+    pthread_mutex_unlock(&g_map_lock);
+    return used;
+}
+
+/* True when the slot map lists the command among the device's edited touch buttons */
+bool device_screen_button_has_cmd(uint8_t slot, const char *dev_id, const char *cmd) {
+    bool found = false;
+    pthread_mutex_lock(&g_map_lock);
+    cJSON *map = get_remote_map_unlocked(slot);
+    cJSON *mdevs = map ? cJSON_GetObjectItemCaseSensitive(map, "devices") : NULL;
+    cJSON *mdev = mdevs ? cJSON_GetObjectItemCaseSensitive(mdevs, dev_id) : NULL;
+    cJSON *sbtns = mdev ? cJSON_GetObjectItemCaseSensitive(mdev, "screen_buttons") : NULL;
+    cJSON *b = NULL;
+    cJSON_ArrayForEach(b, sbtns) {
+        cJSON *jcmd = cJSON_GetObjectItemCaseSensitive(b, "command");
+        if (cJSON_IsString(jcmd) && strcmp(jcmd->valuestring, cmd) == 0) { found = true; break; }
+    }
+    pthread_mutex_unlock(&g_map_lock);
+    return found;
+}
+
 void *config_push_worker(void *arg) {
     (void)arg;
     static pthread_mutex_t push_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -380,6 +456,7 @@ void *config_push_worker(void *arg) {
         uint8_t target_slot = target_slots[t];
         for (int i = 0; i < dev_count; i++) {
             if (!cJSON_IsArray(dev_cmds[i])) continue;
+            if (push_device_screen_buttons(&f, &queue[t], target_slot, i, devs[i].id, dev_cmds[i])) continue;
             int total = cJSON_GetArraySize(dev_cmds[i]);
             if (total > 255) total = 255;
             int c = 0;

@@ -519,6 +519,12 @@ void save_rf_config(void) {
                 }
                 cJSON_AddItemToArray(cmds, cJSON_CreateString(cname));
             }
+            /* The order the Hub sent them in (touch buttons sorted in the web UI), as indexes
+               into "commands"; without it the commands load in index order */
+            cJSON *order = cJSON_AddArrayToObject(d, "cmd_order");
+            for (int c = 0; c < g_rf_dev_cmd_count; c++) {
+                if (g_rf_dev_cmds[c].dev_idx == i) cJSON_AddItemToArray(order, cJSON_CreateNumber(g_rf_dev_cmds[c].cmd_idx));
+            }
         }
         cJSON_AddItemToArray(devs, d);
     }
@@ -670,12 +676,24 @@ void load_rf_config(void) {
                 }
                 cJSON *j_dev_icon_id = cJSON_GetObjectItem(d, "icon_id");
                 g_rf_devices[g_rf_device_count].icon_id = (j_dev_icon_id && cJSON_IsNumber(j_dev_icon_id)) ? (uint16_t)j_dev_icon_id->valueint : 0;
-                int k = 0;
-                cJSON *jc = NULL;
-                cJSON_ArrayForEach(jc, cJSON_GetObjectItem(d, "commands")) {
-                    if (k > 255) break;
-                    if (cJSON_IsString(jc) && jc->valuestring[0]) store_rf_dev_cmd(g_rf_device_count, k, jc->valuestring);
-                    k++;
+                cJSON *jcmds = cJSON_GetObjectItem(d, "commands");
+                cJSON *jorder = cJSON_GetObjectItem(d, "cmd_order");
+                if (cJSON_IsArray(jorder)) {
+                    cJSON *jo = NULL;
+                    cJSON_ArrayForEach(jo, jorder) {
+                        if (!cJSON_IsNumber(jo) || jo->valueint < 0 || jo->valueint > 255) continue;
+                        cJSON *jc = cJSON_GetArrayItem(jcmds, jo->valueint);
+                        if (cJSON_IsString(jc) && jc->valuestring[0])
+                            store_rf_dev_cmd(g_rf_device_count, (uint8_t)jo->valueint, jc->valuestring);
+                    }
+                } else {
+                    int k = 0;
+                    cJSON *jc = NULL;
+                    cJSON_ArrayForEach(jc, jcmds) {
+                        if (k > 255) break;
+                        if (cJSON_IsString(jc) && jc->valuestring[0]) store_rf_dev_cmd(g_rf_device_count, k, jc->valuestring);
+                        k++;
+                    }
                 }
                 g_rf_device_count++;
             }

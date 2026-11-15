@@ -8,6 +8,7 @@ extern "C" {
 #endif
 
 void *config_push_worker(void *arg);
+bool device_screen_button_has_cmd(uint8_t slot, const char *dev_id, const char *cmd);
 
 #ifdef __cplusplus
 }
