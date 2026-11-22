@@ -3,12 +3,48 @@
 #include "http_util.h"
 #include "config_store.h"
 #include "cJSON.h"
+#include "wpa_conf.h"
+#include "wifi_config.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <unistd.h>
+#include <stdint.h>
+#include <arpa/inet.h>
+
+static int parse_ipv4(const char *s, uint32_t *out) {
+    struct in_addr a;
+    if (!s || !is_safe_ipv4(s) || inet_pton(AF_INET, s, &a) != 1) return 0;
+    *out = ntohl(a.s_addr);
+    return 1;
+}
+
+/* NULL when a static address, mask, gateway (optional) and DNS list (optional, space or comma
+ * separated) can work together, otherwise the reason */
+static const char *static_address_error(const char *ip_s, const char *mask_s, const char *gw_s, const char *dns_s) {
+    uint32_t ip, mask, gw;
+    if (!parse_ipv4(ip_s, &ip)) return "Static mode needs a valid IPv4 address";
+    if (!parse_ipv4(mask_s, &mask) || mask == 0 || ((~mask) & ((~mask) + 1)) != 0) return "Invalid netmask";
+    uint32_t net = ip & mask, host = ip & ~mask;
+    if ((ip >> 24) == 0 || (ip >> 24) == 127 || (ip >> 24) >= 224) return "The address cannot be used by a host";
+    if (~mask > 1 && (host == 0 || host == ~mask)) return "The address is the network or broadcast address of its subnet";
+    if (gw_s && gw_s[0]) {
+        if (!parse_ipv4(gw_s, &gw)) return "Invalid gateway address";
+        if ((gw & mask) != net || gw == ip) return "The gateway is not in the same subnet as the address";
+    }
+    if (dns_s && dns_s[0]) {
+        char buf[64], *save = NULL;
+        if (strlen(dns_s) >= sizeof(buf)) return "Invalid DNS server list";
+        snprintf(buf, sizeof(buf), "%s", dns_s);
+        for (char *tok = strtok_r(buf, " ,", &save); tok; tok = strtok_r(NULL, " ,", &save)) {
+            uint32_t d;
+            if (!parse_ipv4(tok, &d)) return "Invalid DNS server address";
+        }
+    }
+    return NULL;
+}
 
 int http_api_network_handle(int client_fd, const char *method, const char *clean_path,
                             const char *query, const char *body, const char *req) {
@@ -94,6 +130,7 @@ int http_api_network_handle(int client_fd, const char *method, const char *clean
         cJSON_AddStringToObject(st, "wifi_ssid", wifi_ssid);
 
         cJSON *cfg = cJSON_CreateObject();
+        int usb_wifi = 1; /* Wi-Fi setup over USB (hub_util usbwifi): on unless USB_WIFI_SETUP=0 */
         FILE *cff = fopen(config_store_path("ethernet.conf"), "r");
         if (cff) {
             char cline[128];
@@ -116,9 +153,11 @@ int http_api_network_handle(int client_fd, const char *method, const char *clean
                 else if (strcmp(k, "ETH_NETMASK") == 0) cJSON_AddStringToObject(cfg, "eth_netmask", v);
                 else if (strcmp(k, "ETH_GATEWAY") == 0) cJSON_AddStringToObject(cfg, "eth_gateway", v);
                 else if (strcmp(k, "ETH_DNS") == 0) cJSON_AddStringToObject(cfg, "eth_dns", v);
+                else if (strcmp(k, "USB_WIFI_SETUP") == 0) usb_wifi = strcmp(v, "0") != 0;
             }
             fclose(cff);
         }
+        cJSON_AddBoolToObject(cfg, "usb_wifi_setup", usb_wifi);
         cJSON_AddItemToObject(st, "config", cfg);
 
         char ifconfig_buf[8192] = {0};
@@ -136,8 +175,8 @@ int http_api_network_handle(int client_fd, const char *method, const char *clean
         return 1;
     }
 
-    /* Route: GET /api/wifi-scan or GET /api/wifi/scan */
-    if ((strcmp(clean_path, "/api/wifi-scan") == 0 || strcmp(clean_path, "/api/wifi/scan") == 0) && strcmp(method, "GET") == 0) {
+    /* Route: GET /api/wifi-scan */
+    if (strcmp(clean_path, "/api/wifi-scan") == 0 && strcmp(method, "GET") == 0) {
         cJSON *resp = cJSON_CreateObject();
         cJSON_AddBoolToObject(resp, "ok", 1);
         cJSON *networks = cJSON_CreateArray();
@@ -172,7 +211,10 @@ int http_api_network_handle(int client_fd, const char *method, const char *clean
             }
 
             char err_buf[256] = {0};
-            int res = net_test_wifi_connection(raw_ssid, pass_buf, is_open, is_hidden, err_buf, sizeof(err_buf));
+            const char *bad = wpa_conf_value_error(raw_ssid, 0);
+            if (!bad && !is_open) bad = wpa_conf_value_error(pass_buf, 1);
+            int res = bad ? -1 : net_test_wifi_connection(raw_ssid, pass_buf, is_open, is_hidden, err_buf, sizeof(err_buf));
+            if (bad) snprintf(err_buf, sizeof(err_buf), "%s", bad);
             cJSON_Delete(params);
 
             cJSON *resp = cJSON_CreateObject();
@@ -208,9 +250,8 @@ int http_api_network_handle(int client_fd, const char *method, const char *clean
 
             const char *raw_ssid = (p_ssid && cJSON_IsString(p_ssid)) ? p_ssid->valuestring : "";
             if (raw_ssid[0]) {
-                char esc_ssid[128] = {0};
+                /* written as typed: wpa_supplicant reads a quoted value without escapes */
                 char esc_pass[128] = {0};
-                escape_wpa_str(raw_ssid, esc_ssid, sizeof(esc_ssid));
 
                 int is_open = (p_open && ((cJSON_IsBool(p_open) && cJSON_IsTrue(p_open)) || (cJSON_IsNumber(p_open) && p_open->valueint == 1) || (cJSON_IsString(p_open) && strcmp(p_open->valuestring, "1") == 0)));
                 int is_hidden = (p_hid && ((cJSON_IsBool(p_hid) && cJSON_IsTrue(p_hid)) || (cJSON_IsNumber(p_hid) && p_hid->valueint == 1) || (cJSON_IsString(p_hid) && strcmp(p_hid->valuestring, "1") == 0)));
@@ -221,9 +262,17 @@ int http_api_network_handle(int client_fd, const char *method, const char *clean
                 int should_apply = (strcmp(app_mode, "reconfigure") == 0 || strcmp(app_mode, "apply") == 0 || strcmp(app_mode, "1") == 0 || strcmp(app_mode, "reboot") == 0);
 
                 if (p_pass && cJSON_IsString(p_pass) && p_pass->valuestring[0]) {
-                    escape_wpa_str(p_pass->valuestring, esc_pass, sizeof(esc_pass));
+                    snprintf(esc_pass, sizeof(esc_pass), "%s", p_pass->valuestring);
                 } else if (keep_pass && !is_open) {
                     net_get_current_wifi_psk(esc_pass, sizeof(esc_pass));
+                }
+                const char *bad = wpa_conf_value_error(raw_ssid, 0);
+                if (!bad && !is_open) bad = wpa_conf_value_error(esc_pass, 1);
+                if (bad) {
+                    cJSON_Delete(params);
+                    send_json_error(client_fd, 400, bad);
+                    close(client_fd);
+                    return 1;
                 }
 
                 if (should_apply && !force_save) {
@@ -243,38 +292,17 @@ int http_api_network_handle(int client_fd, const char *method, const char *clean
                     }
                 }
 
-                char wpa_buf[1024];
-                if (is_open) {
-                    snprintf(wpa_buf, sizeof(wpa_buf),
-                        "ctrl_interface=/var/run/wpa_supplicant\n"
-                        "update_config=1\n\n"
-                        "network={\n"
-                        "\tssid=\"%s\"\n"
-                        "\tkey_mgmt=NONE\n"
-                        "%s"
-                        "}\n",
-                        esc_ssid,
-                        is_hidden ? "\tscan_ssid=1\n" : "");
-                } else {
-                    snprintf(wpa_buf, sizeof(wpa_buf),
-                        "ctrl_interface=/var/run/wpa_supplicant\n"
-                        "update_config=1\n\n"
-                        "network={\n"
-                        "\tssid=\"%s\"\n"
-                        "\tpsk=\"%s\"\n"
-                        "%s"
-                        "}\n",
-                        esc_ssid, esc_pass,
-                        is_hidden ? "\tscan_ssid=1\n" : "");
+                /* both files or neither (wifi_config.c); a failed save keeps the old ones */
+                int reboot_after = strcmp(app_mode, "reboot") == 0;
+                if (wifi_config_save(raw_ssid, esc_pass, is_open, is_hidden, should_apply && !reboot_after) != 0) {
+                    cJSON_Delete(params);
+                    send_json_error(client_fd, 500, "Could not save the Wi-Fi settings (flash full?)");
+                    close(client_fd);
+                    return 1;
                 }
 
-                write_file_content("/etc/wpa_supplicant.conf", wpa_buf);
-                write_file_content("/etc/wpa_supplicant.ath0.conf", wpa_buf);
-
-                if (strcmp(app_mode, "reboot") == 0) {
+                if (reboot_after) {
                     system("/data/harmony/bin/safe_reboot.sh 2>/dev/null || (killall -9 hub_rf hub_btstack 2>/dev/null; /data/harmony/bin/hub_sync 2>/dev/null; sleep 2; reboot -f) &");
-                } else if (should_apply) {
-                    system("/usr/sbin/wpa_cli -i ath0 reconfigure 2>/dev/null || killall -HUP wpa_supplicant 2>/dev/null &");
                 }
 
                 cJSON_Delete(params);
@@ -312,6 +340,7 @@ int http_api_network_handle(int client_fd, const char *method, const char *clean
             cJSON *p_mask = cJSON_GetObjectItemCaseSensitive(params, "eth_netmask");
             cJSON *p_gw = cJSON_GetObjectItemCaseSensitive(params, "eth_gateway");
             cJSON *p_dns = cJSON_GetObjectItemCaseSensitive(params, "eth_dns");
+            cJSON *p_usb = cJSON_GetObjectItemCaseSensitive(params, "usb_wifi_setup");
 
             int eth_en = 1;
             if (p_en) {
@@ -326,6 +355,16 @@ int http_api_network_handle(int client_fd, const char *method, const char *clean
                 else if (cJSON_IsString(p_fb)) eth_fb = (strcmp(p_fb->valuestring, "0") != 0 && strcasecmp(p_fb->valuestring, "false") != 0);
             }
 
+            /* Unlike the other fields, usb_wifi_setup left out keeps the stored value: the web UIs
+             * send it only after reading the stored value, and an Ethernet save from an older
+             * client must not turn the USB setup back on */
+            int usb_wifi = wifi_usb_setup_setting(config_store_path("ethernet.conf"));
+            if (p_usb) {
+                if (cJSON_IsBool(p_usb)) usb_wifi = cJSON_IsTrue(p_usb);
+                else if (cJSON_IsNumber(p_usb)) usb_wifi = (p_usb->valueint != 0);
+                else if (cJSON_IsString(p_usb)) usb_wifi = (strcmp(p_usb->valuestring, "0") != 0 && strcasecmp(p_usb->valuestring, "false") != 0);
+            }
+
             const char *mode_val = (p_mode && cJSON_IsString(p_mode) && strcasecmp(p_mode->valuestring, "static") == 0) ? "static" : "dhcp";
             const char *raw_ip = (p_ip && cJSON_IsString(p_ip)) ? p_ip->valuestring : "";
             const char *raw_mask = (p_mask && cJSON_IsString(p_mask)) ? p_mask->valuestring : "255.255.255.0";
@@ -337,6 +376,18 @@ int http_api_network_handle(int client_fd, const char *method, const char *clean
             const char *valid_gw = is_safe_ipv4(raw_gw) ? raw_gw : "";
             const char *valid_dns = (is_safe_param(raw_dns, ". ,") && strlen(raw_dns) < 64) ? raw_dns : "";
 
+            /* A static address is applied to Ethernet and Wi-Fi with no way back: refuse values
+             * that cannot work instead of saving them (dhcp mode keeps the old lenient handling) */
+            if (strcmp(mode_val, "static") == 0) {
+                const char *bad = static_address_error(raw_ip, raw_mask, raw_gw, raw_dns);
+                if (bad) {
+                    cJSON_Delete(params);
+                    send_json_error(client_fd, 400, bad);
+                    close(client_fd);
+                    return 1;
+                }
+            }
+
             snprintf(conf_buf, sizeof(conf_buf),
                 "ETH_ENABLED=%d\n"
                 "ETH_FALLBACK_WIFI=%d\n"
@@ -344,10 +395,16 @@ int http_api_network_handle(int client_fd, const char *method, const char *clean
                 "ETH_IP=\"%s\"\n"
                 "ETH_NETMASK=\"%s\"\n"
                 "ETH_GATEWAY=\"%s\"\n"
-                "ETH_DNS=\"%s\"\n",
-                eth_en, eth_fb, mode_val, valid_ip, valid_mask, valid_gw, valid_dns);
+                "ETH_DNS=\"%s\"\n"
+                "USB_WIFI_SETUP=%d\n",
+                eth_en, eth_fb, mode_val, valid_ip, valid_mask, valid_gw, valid_dns, usb_wifi);
 
-            write_file_content(config_store_path("ethernet.conf"), conf_buf);
+            if (write_file_content(config_store_path("ethernet.conf"), conf_buf) != 0) {
+                cJSON_Delete(params);
+                send_json_error(client_fd, 500, "Could not save the Ethernet settings (flash full?)");
+                close(client_fd);
+                return 1;
+            }
 
             cJSON *p_app = cJSON_GetObjectItemCaseSensitive(params, "apply");
             if (p_app && cJSON_IsString(p_app) && (strcmp(p_app->valuestring, "apply") == 0 || strcmp(p_app->valuestring, "1") == 0 || strcmp(p_app->valuestring, "reconfigure") == 0 || strcmp(p_app->valuestring, "restart") == 0)) {

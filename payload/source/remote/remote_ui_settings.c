@@ -27,13 +27,26 @@ int get_settings_sub_count(void) {
     }
 }
 
+/* Row geometry of the Settings pages, used by the drawing and by settings_item_at() */
+#define SETTINGS_CAT_Y        UI_CONTENT_Y
+#define SETTINGS_CAT_H        35
+#define SETTINGS_CAT_GAP      4
+#define SETTINGS_CONFIRM_Y    (38 + 130 + 10) /* below the 130 px text card at 38 */
+#define SETTINGS_CONFIRM_H    38
+#define SETTINGS_CONFIRM_GAP  8
+#define SETTINGS_UPDATE_INFO_Y (SETTINGS_LIST_Y - 4)
+#define SETTINGS_UPDATE_INFO_H 76
+#define SETTINGS_UPDATE_Y     (SETTINGS_UPDATE_INFO_Y + SETTINGS_UPDATE_INFO_H + 6)
+#define SETTINGS_UPDATE_H     34
+#define SETTINGS_UPDATE_GAP   5
+
 /* Where the cards of a Settings list sit: the category list starts under the status bar, an
    item list under its heading. Themes with large labels stretch the cards over the screen. */
 void settings_list_geometry(bool categories, int count, int *start_y, int *card_h, int *spacing) {
-    *start_y = categories ? 38 : SETTINGS_LIST_Y;
+    *start_y = categories ? SETTINGS_CAT_Y : SETTINGS_LIST_Y;
     if (categories) {
-        *card_h = 35;
-        *spacing = 4;
+        *card_h = SETTINGS_CAT_H;
+        *spacing = SETTINGS_CAT_GAP;
     } else {
         *card_h = (count >= 7) ? 30 : ((count >= 6) ? 34 : 36);
         *spacing = (count >= 7) ? 3 : ((count >= 6) ? 4 : 5);
@@ -43,6 +56,31 @@ void settings_list_geometry(bool categories, int count, int *start_y, int *card_
         int h = (FB_HEIGHT - 6 - *start_y - (count - 1) * *spacing) / count;
         if (h > *card_h) *card_h = h;
     }
+}
+
+int settings_item_at(int y) {
+    int y0, h, gap, n = get_settings_sub_count();
+    switch (g_settings_subview) {
+        case SETTINGS_VIEW_CATEGORIES:
+            settings_list_geometry(true, n, &y0, &h, &gap);
+            break;
+        case SETTINGS_VIEW_FACTORY_RESET:
+        case SETTINGS_VIEW_REBOOT:
+        case SETTINGS_VIEW_SUSPEND:
+            y0 = SETTINGS_CONFIRM_Y; h = SETTINGS_CONFIRM_H; gap = SETTINGS_CONFIRM_GAP;
+            break;
+        case SETTINGS_VIEW_UPDATE:
+            y0 = SETTINGS_UPDATE_Y; h = SETTINGS_UPDATE_H; gap = SETTINGS_UPDATE_GAP;
+            break;
+        default:
+            settings_list_geometry(false, n, &y0, &h, &gap);
+            break;
+    }
+    for (int i = 0; i < n; i++) {
+        int cy = y0 + i * (h + gap);
+        if (y >= cy && y < cy + h) return i;
+    }
+    return -1;
 }
 
 static void render_settings_categories(void) {
@@ -90,18 +128,26 @@ static void render_settings_categories(void) {
         int name_y = large ? y + (card_h - 36) / 2 : y + 3;
         bool has_icon = blit_png_file(14, large ? y + (card_h - icon_s) / 2 : y + 7, icon_s, icon_s, cat_icons[i]);
         int text_x = has_icon ? 14 + icon_s + 6 : 14;
-        fb_draw_text_aa(text_x, name_y, cat_names[i], is_sel ? RGB_WHITE : RGB_CYAN, &g_font_title);
-        fb_draw_text_aa(text_x, name_y + (large ? 19 : 16), cat_descs[i], RGB_TEXT_MUTED, &g_font_main);
-
         int mid_y = y + (card_h - 15) / 2;
+
+        /* The badge first: the title and the description are fitted to the space left of it */
         bool ota_avail = g_update_ota_available && harmony_version_compare(g_hub_ota_version, HARMONY_REMOTE_VERSION) > 0;
+        int badge_x = FB_WIDTH - 12;
         if (i == 5 && ota_avail) {
-            fb_draw_text_aa(FB_WIDTH - 64, large ? mid_y : y + 10, "[UPDATE]", RGB_YELLOW, &g_font_main);
+            badge_x = FB_WIDTH - 64;
+            fb_draw_text_aa(badge_x, large ? mid_y : y + 10, "[UPDATE]", RGB_YELLOW, &g_font_main);
         } else if (i == 0 && g_update_config_available) {
-            fb_draw_text_aa(FB_WIDTH - 55, large ? mid_y : y + 10, "[SYNC]", RGB_TEAL, &g_font_main);
+            badge_x = FB_WIDTH - 55;
+            fb_draw_text_aa(badge_x, large ? mid_y : y + 10, "[SYNC]", RGB_TEAL, &g_font_main);
         } else if (g_theme.chevrons) {
-            fb_draw_text_aa(FB_WIDTH - 20, y + 9, ">", is_sel ? RGB_TEAL : RGB_TEXT_MUTED, &g_font_title);
+            badge_x = FB_WIDTH - 20;
+            fb_draw_text_aa(badge_x, y + 9, ">", is_sel ? RGB_TEAL : RGB_TEXT_MUTED, &g_font_title);
         }
+        char fit[64];
+        fb_draw_text_aa(text_x, name_y, fb_fit_text_aa(fit, sizeof(fit), cat_names[i], &g_font_title, badge_x - 4 - text_x),
+                        is_sel ? RGB_WHITE : RGB_CYAN, &g_font_title);
+        fb_draw_text_aa(text_x, name_y + (large ? 19 : 16), fb_fit_text_aa(fit, sizeof(fit), cat_descs[i], &g_font_main, badge_x - 4 - text_x),
+                        RGB_TEXT_MUTED, &g_font_main);
     }
 }
 
@@ -132,22 +178,29 @@ static void render_settings_items(const char *title, int count, const char **lab
 
         bool has_value = values && values[i][0];
         uint16_t val_col = val_colors ? val_colors[i] : RGB_TEAL;
+        char fit[64];
         if (large) {
             /* Like the categories: the label in the title font, the value under it */
-            char fit[64];
             int block_h = has_value ? 36 : g_font_title.ascent;
             int ly = y + (card_h - block_h) / 2;
             fb_fit_text_aa(fit, sizeof(fit), labels[i], &g_font_title, FB_WIDTH - 16 - text_x);
             fb_draw_text_aa(text_x, ly, fit, text_col, &g_font_title);
-            if (has_value) fb_draw_text_aa(text_x, ly + 19, values[i], val_col, &g_font_main);
+            if (has_value) {
+                fb_fit_text_aa(fit, sizeof(fit), values[i], &g_font_main, FB_WIDTH - 16 - text_x);
+                fb_draw_text_aa(text_x, ly + 19, fit, val_col, &g_font_main);
+            }
             continue;
         }
 
+        /* The value first, right-aligned: the label is fitted to the space left of it */
+        int label_end = FB_WIDTH - 18;
         if (has_value) {
             int vw = fb_text_width_aa(values[i], &g_font_main);
             fb_draw_text_aa(FB_WIDTH - 18 - vw, y + text_dy, values[i], val_col, &g_font_main);
+            label_end = FB_WIDTH - 18 - vw - 6;
         }
-        fb_draw_text_aa(text_x, y + text_dy, labels[i], text_col, &g_font_main);
+        fb_draw_text_aa(text_x, y + text_dy, fb_fit_text_aa(fit, sizeof(fit), labels[i], &g_font_main, label_end - text_x),
+                        text_col, &g_font_main);
     }
 }
 
@@ -159,19 +212,20 @@ static void render_settings_factory_reset(void) {
         fb_draw_text_aa(8, card_y + 10, "REVERT TO STOCK FIRMWARE", RGB_YELLOW, &g_font_title);
         fb_draw_text_aa(8, card_y + 36, "Removes custom software", RGB_WHITE, &g_font_main);
         fb_draw_text_aa(8, card_y + 56, "and restores official Logitech UI.", RGB_WHITE, &g_font_main);
-        fb_draw_text_aa(8, card_y + 82, "Configs preserved on flash:", RGB_TEAL, &g_font_main);
-        fb_draw_text_aa(8, card_y + 100, "/data/remote_settings.conf", RGB_GREEN, &g_font_main);
+        fb_draw_text_aa(8, card_y + 82, "Deletes settings, Hub names,", RGB_TEAL, &g_font_main);
+        fb_draw_text_aa(8, card_y + 100, "logs and SSH keys.", RGB_GREEN, &g_font_main);
     } else {
         fb_draw_text_aa(8, card_y + 10, "ARE YOU ABSOLUTELY SURE?", RGB_RED, &g_font_title);
         fb_draw_text_aa(8, card_y + 36, "Remote will restore stock startup,", RGB_WHITE, &g_font_main);
         fb_draw_text_aa(8, card_y + 56, "sync flash, and reboot to Logitech.", RGB_WHITE, &g_font_main);
-        fb_draw_text_aa(8, card_y + 82, "Re-running install restores setups.", RGB_TEAL, &g_font_main);
+        fb_draw_text_aa(8, card_y + 82, "The RF pairing is kept.", RGB_TEAL, &g_font_main);
         fb_draw_text_aa(8, card_y + 100, "Device reboots immediately.", RGB_YELLOW, &g_font_main);
     }
 
-    int btn_y = card_y + card_h + 10;
-    int btn_h = 38;
-    int spacing = 8;
+    (void)card_h;
+    int btn_y = SETTINGS_CONFIRM_Y;
+    int btn_h = SETTINGS_CONFIRM_H;
+    int spacing = SETTINGS_CONFIRM_GAP;
 
     const char *btn_labels[2][2] = {
         { tr(STR_CANCEL_KEEP_SYSTEM), tr(STR_PROCEED_TO_RESET) },
@@ -207,9 +261,10 @@ static void render_settings_reboot(void) {
     fb_draw_text_aa(8, card_y + 76, "connection will be restored.", RGB_WHITE, &g_font_main);
     fb_draw_text_aa(8, card_y + 100, "Device reboots in a few seconds.", RGB_TEAL, &g_font_main);
 
-    int btn_y = card_y + card_h + 10;
-    int btn_h = 38;
-    int spacing = 8;
+    (void)card_h;
+    int btn_y = SETTINGS_CONFIRM_Y;
+    int btn_h = SETTINGS_CONFIRM_H;
+    int spacing = SETTINGS_CONFIRM_GAP;
 
     const char *btn_labels[2] = {
         tr(STR_CANCEL_DO_NOT_REBOOT),
@@ -256,9 +311,10 @@ static void render_settings_suspend(void) {
         fb_draw_text_aa(8, card_y + 104, "Put remote down on table.", RGB_TEAL, &g_font_main);
     }
 
-    int btn_y = card_y + card_h + 10;
-    int btn_h = 38;
-    int spacing = 8;
+    (void)card_h;
+    int btn_y = SETTINGS_CONFIRM_Y;
+    int btn_h = SETTINGS_CONFIRM_H;
+    int spacing = SETTINGS_CONFIRM_GAP;
 
     const char *btn_labels[2] = {
         tr(STR_CANCEL_STAY_AWAKE),
@@ -282,8 +338,8 @@ static void render_settings_suspend(void) {
 static void render_settings_update(void) {
     fb_draw_text_aa(14, SETTINGS_HEADING_Y, tr(STR_CAT_UPDATE), RGB_CYAN, &g_font_title);
 
-    int start_y = SETTINGS_LIST_Y - 4;
-    int card_h = 76;
+    int start_y = SETTINGS_UPDATE_INFO_Y;
+    int card_h = SETTINGS_UPDATE_INFO_H;
 
     fb_fill_round_rect(8, start_y, FB_WIDTH - 16, card_h, g_theme.corner_radius, RGB_CARD);
     fb_draw_round_rect(8, start_y, FB_WIDTH - 16, card_h, g_theme.corner_radius, RGB_CARD_BORDER);
@@ -321,9 +377,9 @@ static void render_settings_update(void) {
         "/opt/luadraws/appscommon/asset/footer/settings.png"
     };
 
-    int item_y_start = start_y + card_h + 6;
-    int item_h = 34;
-    int spacing = 5;
+    int item_y_start = SETTINGS_UPDATE_Y;
+    int item_h = SETTINGS_UPDATE_H;
+    int spacing = SETTINGS_UPDATE_GAP;
 
     for (int i = 0; i < 2; i++) {
         int y = item_y_start + i * (item_h + spacing);
@@ -338,13 +394,14 @@ static void render_settings_update(void) {
         int tx = has_icon ? 40 : 14;
 
         uint16_t fg = is_sel ? RGB_WHITE : RGB_CYAN;
-        fb_draw_text_aa(tx, y + 9, labels[i], fg, &g_font_main);
-
+        int badge_x = (i == 0 && ota_avail) ? FB_WIDTH - 55 : FB_WIDTH - 20;
         if (i == 0 && ota_avail) {
-            fb_draw_text_aa(FB_WIDTH - 55, y + 9, "[READY]", RGB_YELLOW, &g_font_main);
+            fb_draw_text_aa(badge_x, y + 9, "[READY]", RGB_YELLOW, &g_font_main);
         } else if (g_theme.chevrons) {
-            fb_draw_text_aa(FB_WIDTH - 20, y + 9, ">", is_sel ? RGB_TEAL : RGB_TEXT_MUTED, &g_font_main);
+            fb_draw_text_aa(badge_x, y + 9, ">", is_sel ? RGB_TEAL : RGB_TEXT_MUTED, &g_font_main);
         }
+        char fit[64];
+        fb_draw_text_aa(tx, y + 9, fb_fit_text_aa(fit, sizeof(fit), labels[i], &g_font_main, badge_x - 4 - tx), fg, &g_font_main);
     }
 }
 

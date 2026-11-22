@@ -1,4 +1,6 @@
 // Core HTTP and WebSocket client for Harmony Hub
+import { t } from '../i18n/index.js';
+
 export class HarmonyClientCore {
   constructor(hub = null) {
     this.wsPendingReqs = new Map();
@@ -51,6 +53,9 @@ export class HarmonyClientCore {
 
   connectWebSocket(force = false) {
     if (!this.wsUrl) return;
+    // A forced connect (login, logout, a new Hub) starts again after a refused login
+    if (force) this.wsPaused = false;
+    if (this.wsPaused) return;
 
     if (!force && this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
       return;
@@ -102,6 +107,7 @@ export class HarmonyClientCore {
 
   scheduleWsReconnect() {
     if (this.wsReconnectTimer) clearTimeout(this.wsReconnectTimer);
+    if (this.wsPaused) return;
     this.wsReconnectTimer = setTimeout(() => {
       this.connectWebSocket();
     }, 3000);
@@ -124,9 +130,35 @@ export class HarmonyClientCore {
     }
   }
 
+  // Drops the local session data only; the caller tells the Hub (logout) if it wants to
+  clearStoredToken() {
+    const hadToken = Boolean(this.token);
+    this.token = null;
+    if (this.authHeader && this.authHeader.startsWith('Bearer ')) this.authHeader = null;
+    if (typeof localStorage !== 'undefined') {
+      localStorage.removeItem('harmony_auth_token');
+      localStorage.removeItem('harmony_auth_user');
+      localStorage.removeItem('harmony_auth_role');
+    }
+    return hadToken;
+  }
+
+  // The Hub refused the credentials (expired or revoked session, Hub restarted, auth turned on):
+  // forget the token, stop retrying the WebSocket with it until the next login, and let the app
+  // ask for a login
+  handleUnauthorized() {
+    this.clearStoredToken();
+    this.wsPaused = true;
+    this.disconnectWebSocket();
+    if (this.onWsStatus) this.onWsStatus(false);
+    if (typeof window !== 'undefined' && window.dispatchEvent) {
+      window.dispatchEvent(new CustomEvent('harmony:unauthorized'));
+    }
+  }
+
   getHeaders(extra = {}) {
     const headers = { ...extra };
-    if (this.authHeader) {
+    if (this.authHeader && !headers['Authorization']) {
       headers['Authorization'] = this.authHeader;
     }
     return headers;
@@ -134,8 +166,9 @@ export class HarmonyClientCore {
 
   async request(path, options = {}) {
     const url = this.buildUrl(path);
+    const { ignoreUnauthorized, ...fetchOptions } = options;
     const opts = {
-      ...options,
+      ...fetchOptions,
       headers: this.getHeaders(options.headers || {})
     };
 
@@ -147,10 +180,8 @@ export class HarmonyClientCore {
       const res = await fetch(url, opts);
       clearTimeout(timeout);
       if (res.status === 401) {
-        if (typeof window !== 'undefined' && window.dispatchEvent) {
-          window.dispatchEvent(new CustomEvent('harmony:unauthorized'));
-        }
-        throw new Error('Authentication failed. Check hub credentials.');
+        if (!ignoreUnauthorized) this.handleUnauthorized();
+        throw new Error(t('auth_failed_check_credentials', 'Authentication failed. Check hub credentials.'));
       }
       const text = await res.text();
       let j = null;
@@ -161,23 +192,29 @@ export class HarmonyClientCore {
       }
 
       if (!res.ok) {
-        let errMsg = `Hub returned HTTP ${res.status}`;
+        let errMsg = null;
         if (j && (j.error || j.message || j.reply)) {
           errMsg = j.error || j.message || j.reply;
         } else if (text && text.length < 200 && !text.includes('<!DOCTYPE')) {
           errMsg = text;
         }
-        if (res.status === 409 && errMsg.startsWith('Hub returned')) {
-          errMsg = 'Activity switch already in progress';
+        if (!errMsg) {
+          errMsg = res.status === 409
+            ? t('activity_switch_in_progress', 'Activity switch already in progress')
+            : t('hub_returned_http', 'Hub returned HTTP {status}', { status: res.status });
         }
-        throw new Error(errMsg);
+        // the reply stays readable for a caller that shows more than the message (lists of a 409)
+        const httpErr = new Error(errMsg);
+        httpErr.status = res.status;
+        httpErr.data = j;
+        throw httpErr;
       }
 
       return j !== null ? j : text;
     } catch (err) {
       clearTimeout(timeout);
       if (err.name === 'AbortError') {
-        throw new Error('Connection timed out. Check IP and network.');
+        throw new Error(t('connection_timed_out', 'Connection timed out. Check IP and network.'));
       }
       throw err;
     }
@@ -218,7 +255,7 @@ export class HarmonyClientCore {
   async testConnection() {
     try {
       if (!this.baseUrl && !this.hub.host) {
-        return { ok: false, error: 'No hub configured' };
+        return { ok: false, error: t('hub_not_configured', 'No hub configured') };
       }
       const data = await this.request('/health', { timeout: 3000 });
       return { ok: true, data };

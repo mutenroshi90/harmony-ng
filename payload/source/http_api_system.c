@@ -15,6 +15,7 @@
 #include "cJSON.h"
 #include "timezone_db.h"
 #include "hub_led.h"
+#include "http_api_ota.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,6 +56,17 @@ static void get_cache_space_kb(uint64_t *total_kb, uint64_t *free_kb) {
     }
 }
 
+/* /etc is on flash: rewrite only when the content changes (every start applies the settings) */
+static void write_file_if_changed(const char *path, const char *text) {
+    size_t len = 0;
+    char *cur = read_file_text_alloc(path, 4096, &len);
+    int same = cur && len == strlen(text) && memcmp(cur, text, len) == 0;
+    free(cur);
+    if (!same && write_file_content(path, text) != 0) {
+        fprintf(stderr, "[-] Could not write %s\n", path);
+    }
+}
+
 void apply_hub_settings(const struct hub_settings *s) {
     if (!s) return;
     hub_mdns_apply_settings(s);
@@ -64,20 +76,16 @@ void apply_hub_settings(const struct hub_settings *s) {
     if (s->timezone[0]) {
         char posix_tz[64];
         timezone_to_posix(s->timezone, posix_tz, sizeof(posix_tz));
-        FILE *tzf = fopen("/etc/TZ", "w");
-        if (tzf) {
-            fprintf(tzf, "%s\n", posix_tz);
-            fclose(tzf);
-        }
+        char line[80];
+        snprintf(line, sizeof(line), "%s\n", posix_tz);
+        write_file_if_changed("/etc/TZ", line);
         setenv("TZ", posix_tz, 1);
         tzset();
     }
     if (s->ntp_server[0] && !g_dry_run) {
-        FILE *ntpf = fopen("/etc/ntp.conf", "w");
-        if (ntpf) {
-            fprintf(ntpf, "server %s\n", s->ntp_server);
-            fclose(ntpf);
-        }
+        char line[160];
+        snprintf(line, sizeof(line), "server %s\n", s->ntp_server);
+        write_file_if_changed("/etc/ntp.conf", line);
     }
 }
 
@@ -109,7 +117,7 @@ int http_api_system_handle(int client_fd, const char *method, const char *clean_
         get_cache_space_kb(&cache_total_kb, &cache_free_kb);
         cJSON_AddNumberToObject(st, "cache_total_kb", (double)cache_total_kb);
         cJSON_AddNumberToObject(st, "cache_free_kb", (double)cache_free_kb);
-        cJSON_AddBoolToObject(st, "updating", access("/tmp/hub_updating.flag", F_OK) == 0);
+        cJSON_AddBoolToObject(st, "updating", ota_update_busy());
 
         int auth_on = 0;
         load_user_accounts(NULL, 0, &auth_on);
@@ -199,17 +207,18 @@ int http_api_system_handle(int client_fd, const char *method, const char *clean_
     /* Route: GET /api/logs */
     if (strcmp(clean_path, "/api/logs") == 0 && strcmp(method, "GET") == 0) {
         const char *src = "daemon";
-        if (query) {
-            if (strstr(query, "source=btstack")) src = "btstack";
-            else if (strstr(query, "source=rf")) src = "rf";
-            else if (strstr(query, "source=system")) src = "system";
-            else if (strstr(query, "source=network")) src = "network";
-        }
+        char qsrc[16];
+        http_query_param(query, "source", qsrc, sizeof(qsrc));
+        if (strcmp(qsrc, "btstack") == 0) src = "btstack";
+        else if (strcmp(qsrc, "rf") == 0) src = "rf";
+        else if (strcmp(qsrc, "system") == 0) src = "system";
+        else if (strcmp(qsrc, "network") == 0) src = "network";
 
-        const char *filepath = "/tmp/hub_daemon.log";
+        /* init.sh sends the output of hub_daemon and hub_rf to harmony-init.log (hub_btstack keeps
+         * its own file), the network scripts write harmony-network.log */
+        const char *filepath = "/tmp/harmony-init.log";
         if (strcmp(src, "btstack") == 0) filepath = "/tmp/hub-btstack.log";
-        else if (strcmp(src, "rf") == 0) filepath = "/tmp/harmony-init.log";
-        else if (strcmp(src, "network") == 0) filepath = "/tmp/hub-network.log";
+        else if (strcmp(src, "network") == 0) filepath = "/tmp/harmony-network.log";
 
         char log_buf[16384] = {0};
         if (strcmp(src, "system") == 0) {
@@ -473,9 +482,14 @@ int http_api_system_handle(int client_fd, const char *method, const char *clean_
             cJSON_DeleteItemFromObject(cfg, "mqttDevices");
             cJSON_DeleteItemFromObject(cfg, "devices");
 
-            config_store_save_mqtt_json(cfg);
+            int save_rc = config_store_save_mqtt_json(cfg);
             cJSON_Delete(cfg);
             cJSON_Delete(params);
+            if (save_rc != 0) {
+                send_json_error(client_fd, 500, "Could not save the MQTT settings (flash full?)");
+                close(client_fd);
+                return 1;
+            }
 
             daemon_sync_mqtt();
 
@@ -498,7 +512,7 @@ int http_api_system_handle(int client_fd, const char *method, const char *clean_
         if (params) {
             cJSON *p_act = cJSON_GetObjectItemCaseSensitive(params, "action");
             if (p_act && cJSON_IsString(p_act) && strcmp(p_act->valuestring, "reboot") == 0) {
-                if (access("/tmp/hub_updating.flag", F_OK) == 0) {
+                if (ota_update_busy()) {
                     cJSON_Delete(params);
                     send_json_error(client_fd, 409, "Software update in progress. Manual reboot blocked.");
                     close(client_fd);
@@ -511,13 +525,24 @@ int http_api_system_handle(int client_fd, const char *method, const char *clean_
                 send_cjson_resp(client_fd, 200, resp);
                 cJSON_Delete(resp);
                 close(client_fd);
+#ifndef TEST_HARNESS
                 sync();
                 system("/data/harmony/bin/safe_reboot.sh 2>/dev/null || (killall -9 hub_rf hub_btstack 2>/dev/null; /data/harmony/bin/hub_sync 2>/dev/null; sleep 2; reboot -f) 2>/dev/null &");
+#else
+                printf("[*] reboot (test build, not run)\n"); /* never reboot the test host */
+#endif
                 return 1;
             } else if (p_act && cJSON_IsString(p_act) && strcmp(p_act->valuestring, "factory_reset") == 0) {
                 cJSON *p_conf = cJSON_GetObjectItemCaseSensitive(params, "confirm");
                 if (p_conf && cJSON_IsString(p_conf) && strcmp(p_conf->valuestring, "RESET") == 0) {
                     cJSON_Delete(params);
+                    /* The installers do not put the script here: say so instead of answering
+                     * "initiated" for a reset that never runs */
+                    if (access("/data/harmony/bin/factory_reset.sh", X_OK) != 0) {
+                        send_json_error(client_fd, 500, "Factory reset script not installed on this Hub");
+                        close(client_fd);
+                        return 1;
+                    }
                     cJSON *resp = cJSON_CreateObject();
                     cJSON_AddBoolToObject(resp, "ok", 1);
                     cJSON_AddStringToObject(resp, "message", "Factory reset initiated. Reverting to stock firmware and rebooting.");
@@ -594,6 +619,27 @@ int http_api_system_handle(int client_fd, const char *method, const char *clean_
                         close(client_fd);
                         return 1;
                     }
+                    if (renaming) {
+                        /* a name another account has: refused before anything changes (its
+                         * tokens would be taken for leftovers below) */
+                        for (int i = 0; i < ucnt; i++) {
+                            if (i != admin_idx && strcmp(ulist[i].username, uname) == 0) {
+                                cJSON_Delete(params);
+                                send_json_error(client_fd, 409, "Another account already has this name");
+                                close(client_fd);
+                                return 1;
+                            }
+                        }
+                        /* tokens left by a deleted account of the new name must not come back */
+                        int stale = http_tokens_remove_owner(uname);
+                        if (stale < 0) {
+                            cJSON_Delete(params);
+                            if (stale == HTTP_TOKENS_BUSY) send_json_error(client_fd, 503, "The token list is busy, try again");
+                            else send_json_error(client_fd, 500, "Old access tokens of this name could not be removed: " HTTP_TOKENS_UNREADABLE_MSG);
+                            close(client_fd);
+                            return 1;
+                        }
+                    }
                     if (renaming || pass[0]) http_auth_drop_user_sessions(ulist[admin_idx].username);
                     if (renaming) {
                         memset(ulist[admin_idx].username, 0, sizeof(ulist[admin_idx].username));
@@ -604,6 +650,23 @@ int http_api_system_handle(int client_fd, const char *method, const char *clean_
                         compute_ha1(ulist[admin_idx].username, HARMONY_AUTH_REALM, pass, ulist[admin_idx].ha1);
                     }
                 } else if (pass[0] && ucnt < MAX_HTTP_USERS) {
+                    const char *new_name = uname[0] ? uname : "admin";
+                    for (int i = 0; i < ucnt; i++) {
+                        if (strcmp(ulist[i].username, new_name) == 0) {
+                            cJSON_Delete(params);
+                            send_json_error(client_fd, 409, "Another account already has this name");
+                            close(client_fd);
+                            return 1;
+                        }
+                    }
+                    int stale = http_tokens_remove_owner(new_name);
+                    if (stale < 0) {
+                        cJSON_Delete(params);
+                        if (stale == HTTP_TOKENS_BUSY) send_json_error(client_fd, 503, "The token list is busy, try again");
+                        else send_json_error(client_fd, 500, "Old access tokens of this name could not be removed: " HTTP_TOKENS_UNREADABLE_MSG);
+                        close(client_fd);
+                        return 1;
+                    }
                     admin_idx = ucnt++;
                     memset(&ulist[admin_idx], 0, sizeof(ulist[admin_idx]));
                     strncpy(ulist[admin_idx].username, uname[0] ? uname : "admin", sizeof(ulist[admin_idx].username) - 1);
@@ -621,7 +684,12 @@ int http_api_system_handle(int client_fd, const char *method, const char *clean_
                     return 1;
                 }
 
-                save_user_accounts(ulist, ucnt, new_auth_enabled);
+                if (!save_user_accounts(ulist, ucnt, new_auth_enabled)) {
+                    cJSON_Delete(params);
+                    send_json_error(client_fd, 500, "Could not save the user accounts (flash full?)");
+                    close(client_fd);
+                    return 1;
+                }
                 if (new_auth_enabled != curr_auth_enabled) http_auth_drop_all_sessions();
                 cJSON_Delete(params);
 
@@ -629,6 +697,10 @@ int http_api_system_handle(int client_fd, const char *method, const char *clean_
                 cJSON_AddBoolToObject(resp, "ok", 1);
                 cJSON_AddBoolToObject(resp, "auth_enabled", new_auth_enabled);
                 cJSON_AddStringToObject(resp, "message", "Authentication settings updated");
+                if (!curr_auth_enabled && new_auth_enabled) {
+                    /* turned on: the accounts and tokens to check, but the admin set here */
+                    http_auth_add_switch_check(resp, ulist, ucnt, admin_idx >= 0 ? ulist[admin_idx].username : NULL);
+                }
                 send_cjson_resp(client_fd, 200, resp);
                 cJSON_Delete(resp);
                 close(client_fd);
@@ -686,6 +758,13 @@ int http_api_system_handle(int client_fd, const char *method, const char *clean_
                 s.ntp_server[sizeof(s.ntp_server) - 1] = '\0';
             }
             item = cJSON_GetObjectItemCaseSensitive(p, "timezone");
+            if (item && cJSON_IsString(item) && item->valuestring && !timezone_is_known(item->valuestring)) {
+                /* it used to be stored and silently run as Central European time */
+                cJSON_Delete(p);
+                send_json_error(client_fd, 400, "Unknown timezone: use a name from the list or a POSIX TZ string");
+                close(client_fd);
+                return 1;
+            }
             if (item && cJSON_IsString(item) && item->valuestring) {
                 strncpy(s.timezone, item->valuestring, sizeof(s.timezone) - 1);
                 s.timezone[sizeof(s.timezone) - 1] = '\0';
@@ -705,9 +784,14 @@ int http_api_system_handle(int client_fd, const char *method, const char *clean_
                 if (cJSON_IsBool(item)) s.legacy_enabled = cJSON_IsTrue(item) ? 1 : 0;
                 else if (cJSON_IsNumber(item)) s.legacy_enabled = item->valueint ? 1 : 0;
             }
-            config_store_save_settings(&s);
-            apply_hub_settings(&s);
+            int save_rc = config_store_save_settings(&s);
             cJSON_Delete(p);
+            if (save_rc != 0) {
+                send_json_error(client_fd, 500, "Could not save the settings (flash full?)");
+                close(client_fd);
+                return 1;
+            }
+            apply_hub_settings(&s);
         }
         cJSON *resp = cJSON_CreateObject();
         cJSON_AddBoolToObject(resp, "ok", 1);

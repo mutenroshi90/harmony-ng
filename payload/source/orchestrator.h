@@ -49,10 +49,14 @@ typedef struct {
     char command[64];
 } orch_toggle_t;
 
-/* Progress callback for WebSocket broadcasts */
+/* Progress callback for WebSocket broadcasts. step_error: 0, or the negative result of the step
+ * the frame reports (its command could not be sent). failed_steps: -1 when the frame does not
+ * report it, else the number of steps of the transition that could not be sent (on the
+ * "Transition completed" frame). */
 typedef void (*orch_progress_cb)(const char *activity_id, orch_state_t state,
                                  int current_step, int total_steps,
-                                 const char *step_desc, void *user_data);
+                                 const char *step_desc, int step_error, int failed_steps,
+                                 void *user_data);
 
 #ifdef __cplusplus
 extern "C" {
@@ -69,7 +73,8 @@ int orch_is_busy(void);
 /* Steps of the last switch or Help still to send, including background steps */
 int orch_is_sending(void);
 
-/* Current activity ID string ("-1" = PowerOff) */
+/* Current activity ID string ("-1" = PowerOff): a per-thread copy, valid until the same
+ * thread calls again */
 const char *orch_get_current_activity(void);
 
 /* Get current state enum */

@@ -21,7 +21,8 @@ run_monitor() {
     sleep 3
     load_config
 
-    cur_eth=$(find_eth_interface)
+    cur_eth=""
+    [ "$ETH_ENABLED" = "1" ] && cur_eth=$(find_eth_interface)
     if [ -n "$cur_eth" ]; then
       # Ensure interface is up administratively for PHY auto-negotiation & carrier
       ifconfig "$cur_eth" up 2>/dev/null || true
@@ -75,7 +76,6 @@ run_monitor() {
                 send_garp "$cur_eth" "$e_ip"
                 echo 1 > /tmp/eth_conn_pipe 2>/dev/null || true
                 echo "$cur_eth:ethernet:$e_ip" > "$STATE_FILE"
-                stop_recovery_ap 2>/dev/null || true
                 log "Ethernet connected via DHCP: $cur_eth has IP $e_ip"
               fi
             fi

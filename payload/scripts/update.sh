@@ -44,12 +44,18 @@ REPO="${REPO%/bin/mips}"
 REPO="${REPO%/}"
 [ -z "$REPO" ] && REPO="$DEFAULT_OTA"
 
-AUTH_HEADER=""
-if [ -n "$TOKEN_ARG" ]; then
-  AUTH_HEADER="--header Authorization: token ${TOKEN_ARG}"
-fi
 
 TIMESTAMP=$(date +%s 2>/dev/null || echo 1)
+
+# State of the last apply for GET /api/update-status: running, restarting (with the new version)
+# or failed, and since= the seconds since boot (hub_daemon ends a "running" older than 30 minutes
+# on that clock, which SNTP never steps). In RAM: a reboot clears it; the new hub_daemon ends
+# "restarting" when it starts.
+UPDATE_STATE=/tmp/hub_update.state
+set_update_state() {
+  _since=$(now_secs)
+  { echo "state=$1"; [ -z "$2" ] || echo "version=$2"; [ -z "$_since" ] || echo "since=$_since"; } > "$UPDATE_STATE" 2>/dev/null || true
+}
 
 download_retry() {
   local url="$1"
@@ -59,7 +65,12 @@ download_retry() {
   local i=1
   while [ $i -le $max_attempts ]; do
     rm -f "$dst" 2>/dev/null
-    $WGET -q -T "$timeout" $AUTH_HEADER -O "$dst" "$url" 2>/dev/null
+    # the header is one argument: unquoted, the token was passed to wget as extra URLs
+    if [ -n "$TOKEN_ARG" ]; then
+      $WGET -q -T "$timeout" --header "Authorization: token ${TOKEN_ARG}" -O "$dst" "$url" 2>/dev/null
+    else
+      $WGET -q -T "$timeout" -O "$dst" "$url" 2>/dev/null
+    fi
     if [ -s "$dst" ]; then
       return 0
     fi
@@ -177,10 +188,27 @@ install_bundle() {
 
 # The helpers built into hub_util are symlinks to it
 link_hub_util() {
-  for _app in hub_sync sync mknod register_ehci eth_fix hub_dhcpd hub_portal hub_sntp; do
+  for _app in hub_sync sync mknod register_ehci eth_fix hub_sntp; do
     [ -f "/data/harmony/bin/$_app" ] && [ ! -L "/data/harmony/bin/$_app" ] && rm -f "/data/harmony/bin/$_app" 2>/dev/null || true
     ln -sf /data/harmony/bin/hub_util "/data/harmony/bin/$_app" 2>/dev/null || true
   done
+}
+
+link_dropbear() {
+  if [ -s /data/harmony/bin/dropbearmulti ] && [ -x /data/harmony/bin/dropbearmulti ]; then
+    for _app in dropbear dropbearkey dbclient scp; do
+      [ -f "/data/harmony/bin/$_app" ] && [ ! -L "/data/harmony/bin/$_app" ] && rm -f "/data/harmony/bin/$_app" 2>/dev/null || true
+      ln -sf /data/harmony/bin/dropbearmulti "/data/harmony/bin/$_app" 2>/dev/null || true
+    done
+    for _app in dropbearkey dbclient scp; do
+      ln -sf /data/harmony/bin/dropbearmulti "/usr/sbin/$_app" 2>/dev/null || true
+    done
+    _harm_m=$(md5sum /data/harmony/bin/dropbearmulti 2>/dev/null | awk '{print $1}')
+    _data_m=$(md5sum /data/dropbearmulti 2>/dev/null | awk '{print $1}')
+    if [ -n "$_harm_m" ] && { [ "$_harm_m" = "$_data_m" ] || [ "$_harm_m" = "3733327fd04bca282dbf06f33da0bf6c" ]; }; then
+      rm -f /data/dropbearmulti /usr/sbin/dropbearmulti 2>/dev/null || true
+    fi
+  fi
 }
 
 get_local_version() {
@@ -222,20 +250,20 @@ do_check() {
   REMOTE_VER=""
 
   # 1. Try raw GitHub OTA VERSION file with retries (v2 checks v2/VERSION first)
-  if download_retry "${REPO}/v2/VERSION?_=${TIMESTAMP}" /tmp/ota_ver 8 2 || \
-     download_retry "${REPO}/VERSION_V2?_=${TIMESTAMP}" /tmp/ota_ver 8 2 || \
-     download_retry "${REPO}/VERSION?_=${TIMESTAMP}" /tmp/ota_ver 8 3; then
-    REMOTE_VER=$(cat /tmp/ota_ver | tr -d '\r\n v')
+  if download_retry "${REPO}/v2/VERSION?_=${TIMESTAMP}" /tmp/ota_ver.$$ 8 2 || \
+     download_retry "${REPO}/VERSION_V2?_=${TIMESTAMP}" /tmp/ota_ver.$$ 8 2 || \
+     download_retry "${REPO}/VERSION?_=${TIMESTAMP}" /tmp/ota_ver.$$ 8 3; then
+    REMOTE_VER=$(cat /tmp/ota_ver.$$ | tr -d '\r\n v')
   fi
 
   # 2. Fallback: try GitHub releases API
   if [ -z "$REMOTE_VER" ]; then
-    if download_retry "https://api.github.com/repos/iranl/harmony-ng/releases/latest" /tmp/gh_rel 10 2; then
-      REMOTE_VER=$(cat /tmp/gh_rel | awk -F'"tag_name":' '{print $2}' | awk -F'"' '{print $2}' | tr -d '\r\n v')
+    if download_retry "https://api.github.com/repos/iranl/harmony-ng/releases/latest" /tmp/gh_rel.$$ 10 2; then
+      REMOTE_VER=$(cat /tmp/gh_rel.$$ | awk -F'"tag_name":' '{print $2}' | awk -F'"' '{print $2}' | tr -d '\r\n v')
     fi
   fi
 
-  rm -f /tmp/ota_ver /tmp/gh_rel 2>/dev/null
+  rm -f /tmp/ota_ver.$$ /tmp/gh_rel.$$ 2>/dev/null
 
   if [ -z "$REMOTE_VER" ]; then
     echo "{\"ok\":false,\"error\":\"Could not fetch remote version from ${REPO}\"}"
@@ -279,8 +307,95 @@ EOF
   return 0
 }
 
+# The services restart at the end of an update must not cut an activity switch in the middle (the devices
+# were left half switched). hub_daemon refuses to start an update while one runs, but a switch can
+# start during the download: wait until GET /api/activity (loopback, no login) reports no switch,
+# no queued request and no steps left to send, twice 1 s apart (a finished switch hands over to its
+# queued follower in between). Gives up after UPDATE_ACTIVITY_WAIT_SECS (600 s) and restarts anyway
+# (the new files are installed already). A query that fails is "unknown", not "no switch": only a
+# hub_daemon that is not running means no switch; one that does not answer for
+# UPDATE_ACTIVITY_FAIL_SECS (60 s) in a row lets the restart go on. Times are real seconds from
+# /proc/uptime (a query can take 3 s; no steps when SNTP sets the clock), counted from the sleeps
+# when it cannot be read.
+UPTIME_FILE="${UPDATE_UPTIME_FILE:-/proc/uptime}"
+now_secs() {
+  _up=""
+  read -r _up _rest 2>/dev/null < "$UPTIME_FILE"
+  _up="${_up%%.*}"
+  case "$_up" in ''|*[!0-9]*) echo "" ;; *) echo "$_up" ;; esac
+}
+# seconds since $1 (now_secs), or $2 (counted from the sleeps) when the uptime cannot be read
+since_secs() {
+  _n=$(now_secs)
+  if [ -n "$1" ] && [ -n "$_n" ]; then echo $((_n - $1)); else echo "$2"; fi
+}
+wait_activity_switch() {
+  local max="${UPDATE_ACTIVITY_WAIT_SECS:-600}"
+  local fail_max="${UPDATE_ACTIVITY_FAIL_SECS:-60}"
+  case "$max" in ''|*[!0-9]*) max=600 ;; esac
+  case "$fail_max" in ''|*[!0-9]*) fail_max=60 ;; esac
+  local start
+  start=$(now_secs)
+  local counted=0
+  local fail_start=""
+  local fail_counted=0
+  local idle=0
+  local said=0
+  local st
+  local qstart
+  while [ "$(since_secs "$start" "$counted")" -lt "$max" ]; do
+    qstart=$(now_secs)
+    if st=$($WGET -q -T 3 -O - "http://127.0.0.1:8089/api/activity" 2>/dev/null); then
+      fail_start=""
+      fail_counted=0
+      if ! echo "$st" | grep -q '"busy":[[:space:]]*true' && \
+         ! echo "$st" | grep -q '"sending":[[:space:]]*true' && \
+         ! echo "$st" | grep -q '"queued":[[:space:]]*"'; then
+        idle=$((idle + 1))
+        if [ "$idle" -ge 2 ]; then
+          [ "$said" = 1 ] && echo "[+] Activity switch finished after $(since_secs "$start" "$counted") s."
+          return 0
+        fi
+        sleep 1
+        counted=$((counted + 1))
+        continue
+      fi
+      idle=0
+      if [ "$said" = 0 ]; then
+        echo "[*] An activity switch is running: the restart waits until it has finished (at most ${max} s)."
+        said=1
+      fi
+    else
+      idle=0
+      if ! pidof hub_daemon >/dev/null 2>&1; then
+        return 0
+      fi
+      if [ -z "$fail_start" ]; then
+        fail_start="$qstart" # from the start of the first failed query
+        [ -z "$fail_start" ] && fail_start="none"
+      fi
+      _fs="$fail_start"
+      [ "$_fs" = "none" ] && _fs=""
+      fail_counted=$((fail_counted + 2))
+      if [ "$(since_secs "$_fs" "$fail_counted")" -ge "$fail_max" ]; then
+        echo "[!] hub_daemon has not answered for $(since_secs "$_fs" "$fail_counted") s: restarting anyway."
+        return 0
+      fi
+    fi
+    sleep 2
+    counted=$((counted + 2))
+  done
+  if [ "$idle" -gt 0 ]; then
+    echo "[*] Waited $(since_secs "$start" "$counted") s: restarting."
+  else
+    echo "[!] The activity switch is still running after $(since_secs "$start" "$counted") s: restarting anyway."
+  fi
+  return 0
+}
+
 do_apply() {
   touch /tmp/hub_updating.flag 2>/dev/null || true
+  set_update_state running
   TMPDIR="/tmp/ota_update"
   trap 'rm -f $INSTALLING /tmp/hub_updating.flag; rm -rf "$TMPDIR" 2>/dev/null' EXIT
   # A kill ends the install (the file being copied stays the old one)
@@ -353,6 +468,11 @@ do_apply() {
       if [ -f "$TMPDIR/pkg/bin/hub_util" ]; then
         link_hub_util
       fi
+      link_dropbear
+      # The package no longer has the recovery access point: its script, settings and the
+      # hub_util links it used go (one still running stops at the next reboot)
+      rm -f /data/harmony/recovery_ap.sh /data/harmony/scripts/recovery_ap.sh /data/harmony/bin/recovery_ap.sh \
+            /data/harmony/recovery_ap.conf /data/harmony/bin/hub_portal /data/harmony/bin/hub_dhcpd 2>/dev/null || true
       for b in $BUNDLE_BINS; do
         [ -f "$TMPDIR/pkg/bin/$b" ] && rm -f "/cache/bin/$b" 2>/dev/null
       done
@@ -481,6 +601,10 @@ do_apply() {
   echo "$NEW_VER" > /data/harmony/remote_ui.version 2>/dev/null || true
   rm -f /data/harmony/update_available.flag /data/harmony/remote_ui.ota.gz /cache/remote_ui.ota.gz \
         /data/harmony/elite_ui.ota.gz /data/harmony/elite_ui.version /cache/elite_ui.ota.gz 2>/dev/null || true
+  # What a reboot cleared and a services restart keeps: the icons extracted from the old
+  # icons.tar.gz (the new hub_daemon extracts them again when the folder is missing) and a remote
+  # image of the old version that hub_rf kept for a resume (sent unverified once its manifest is gone)
+  rm -rf /tmp/www/assets/icons /tmp/remote_ui.ota.gz /tmp/remote_manifest.json /tmp/remote_manifest.json.sig 2>/dev/null || true
 
   # 7. Clean up temporary directory
   rm -rf "$TMPDIR" 2>/dev/null
@@ -488,6 +612,17 @@ do_apply() {
   # 7. Sync filesystem
   /data/harmony/bin/hub_sync 2>/dev/null || /cache/bin/sync 2>/dev/null || sync 2>/dev/null || true
 
+  wait_activity_switch
+  # As build/deploy_hub.py: restarting the services loads the new files, no reboot needed (an
+  # update has no kernel modules; a new rcS.local takes effect at the next boot). Detached, its
+  # output to /dev/null: the services must not write into the apply log.
+  set_update_state restarting "$NEW_VER"
+  if [ -x /data/harmony/init.sh ]; then
+    echo "[+] Update to v${NEW_VER} applied successfully. Restarting Hub services..."
+    rm -f /tmp/harmony_stop 2>/dev/null || true
+    /data/harmony/init.sh restart >/dev/null 2>&1 </dev/null &
+    return 0
+  fi
   echo "[+] Update to v${NEW_VER} applied successfully. Initiating safe Hub reboot..."
   if [ -x /data/harmony/safe_reboot.sh ]; then
     /data/harmony/safe_reboot.sh &
@@ -565,12 +700,61 @@ do_remote_ota() {
   fi
 }
 
+# One apply at a time: every run uses /tmp/ota_update and its exit removes it, so a second
+# run (a double click, two browser tabs) deleted the files the first was installing. The lock
+# is a directory with the owner's pid and start time; one left by a run that was killed is taken
+# over. The start time (field 22 of /proc/<pid>/stat) tells the owner from a later process that
+# got the same pid; a lock written without it falls back to the command line.
+APPLY_LOCK=/tmp/ota_update.lock
+proc_start() {
+  sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}'
+}
+apply_lock_owner_runs() {
+  _owner=$(cat "$APPLY_LOCK/pid" 2>/dev/null)
+  _start=$(cat "$APPLY_LOCK/start" 2>/dev/null)
+  [ -n "$_owner" ] && [ -d "/proc/$_owner" ] || return 1
+  if [ -n "$_start" ]; then
+    [ "$(proc_start "$_owner")" = "$_start" ]
+  else
+    grep -q 'update.sh' "/proc/$_owner/cmdline" 2>/dev/null
+  fi
+}
+apply_locked() {
+  if ! mkdir "$APPLY_LOCK" 2>/dev/null; then
+    if apply_lock_owner_runs; then
+      echo "[-] Another software update is running (pid $_owner); not starting a second one."
+      return 1
+    fi
+    rm -rf "$APPLY_LOCK" 2>/dev/null
+    if ! mkdir "$APPLY_LOCK" 2>/dev/null; then
+      echo "[-] Another software update is starting; not starting a second one."
+      return 1
+    fi
+  fi
+  echo "$$" > "$APPLY_LOCK/pid"
+  proc_start $$ > "$APPLY_LOCK/start"
+  ( do_apply )
+  _rc=$?
+  # A kill -9 of the subshell skips its EXIT trap: the flag must not stay behind (a running update
+  # for 30 minutes), nor the package in RAM (an OOM kill is the likely cause). A "<file>.new" being
+  # copied stays on flash until the next apply removes it. The last "[-]" line says it ended (a
+  # TERM prints none of its own).
+  if [ $_rc -ne 0 ]; then
+    rm -f /tmp/hub_updating.flag 2>/dev/null
+    rm -rf /tmp/ota_update 2>/dev/null
+    echo "[-] The software update ended with exit code $_rc."
+    set_update_state failed
+  fi
+  rm -rf "$APPLY_LOCK" 2>/dev/null
+  return $_rc
+}
+
 case "$CMD" in
   check)
     do_check
     ;;
   apply)
-    do_apply
+    apply_locked
     ;;
   fetch-remote|fetch-remote-ota)
     do_fetch_remote_ota
@@ -586,6 +770,6 @@ case "$CMD" in
     fi
     ;;
   *)
-    do_apply
+    apply_locked
     ;;
 esac

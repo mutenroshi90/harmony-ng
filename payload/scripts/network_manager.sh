@@ -4,8 +4,10 @@
 
 PATH=/cache/bin:/data/harmony/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 CONF=/data/harmony/ethernet.conf
-WPA_CONF=/etc/wpa_supplicant.ath0.conf
-[ -f "$WPA_CONF" ] || WPA_CONF=/etc/wpa_supplicant.conf
+# /etc/wpa_supplicant.conf is the file every writer updates (web UI, backup restore)
+# and the one rcS.local starts wpa_supplicant with; the ath0 copy is only a fallback
+WPA_CONF=/etc/wpa_supplicant.conf
+[ -f "$WPA_CONF" ] || WPA_CONF=/etc/wpa_supplicant.ath0.conf
 
 LOG=/tmp/harmony-network.log
 STATE_FILE=/tmp/harmony_active_net_state
@@ -24,6 +26,61 @@ log() {
   echo "$(date '+%Y-%m-%d %H:%M:%S') [NET] $*" >> "$LOG"
 }
 
+# USB port mode. The Hub's one USB port is either a USB device (a computer can set the Wi-Fi
+# over USB: stock usbhid + hub_usbwifi) or a USB host (Ethernet over USB, start_usb_eth.sh); a
+# switch back to device mode needs a restart. The port stays a device for the boot when a
+# computer set the Hub's USB device up: usbhid connected to hub_usbwifi a second time, which it
+# does each time a computer configures the device (seen on hardware with a Windows PC), or a
+# request from the computer reached hub_usbwifi (a host that set the device up on the first
+# connection, or a tool already talking to the Hub). An
+# interrupt count in /proc/udc (stock usbmgr.lua autoUSBSwap took any count as a computer) only
+# makes the boot wait longer for that second connection, up to USB_PC_WAIT_IRQ seconds: a stray
+# interrupt from an adapter or a charger never keeps the port a device. Without a count the
+# boot waits USB_PC_WAIT seconds. USB_WIFI_SETUP=0 in ethernet.conf skips the wait altogether.
+# The mode decided is written to USB_MODE_FILE (init.sh starts usbhid again only in device mode).
+UDC_PROC=/proc/udc
+USBWIFI_STATE=/tmp/harmony_usbwifi.state
+USB_MODE_FILE=/tmp/harmony_usb_port_mode
+USB_PC_WAIT=6
+USB_PC_WAIT_IRQ=20
+
+udc_interrupts() {
+  sed -n 's/.*Total interrupt count = \([0-9][0-9]*\).*/\1/p' "$UDC_PROC" 2>/dev/null | sed -n 1p
+}
+
+usbwifi_connections() {
+  sed -n 's/^connections=\([0-9][0-9]*\)$/\1/p' "$USBWIFI_STATE" 2>/dev/null | sed -n 1p
+}
+
+usbwifi_requests() {
+  sed -n 's/^requests=\([0-9][0-9]*\)$/\1/p' "$USBWIFI_STATE" 2>/dev/null | sed -n 1p
+}
+
+usb_computer_attached() {
+  # no device controller driver: the port is already a host (or not a USB device at all)
+  [ -e "$UDC_PROC" ] || return 1
+  _wait=0
+  _limit=$USB_PC_WAIT
+  while :; do
+    _con=$(usbwifi_connections)
+    [ -n "$_con" ] && [ "$_con" -ge 2 ] 2>/dev/null && return 0
+    _req=$(usbwifi_requests)
+    [ -n "$_req" ] && [ "$_req" -ge 1 ] 2>/dev/null && return 0
+    _irq=$(udc_interrupts)
+    if [ "$_limit" -lt "$USB_PC_WAIT_IRQ" ] && [ -n "$_irq" ] && [ "$_irq" -gt 0 ] 2>/dev/null; then
+      _limit=$USB_PC_WAIT_IRQ
+      log "USB device controller interrupts seen: waiting up to ${USB_PC_WAIT_IRQ}s for a computer to set the USB device up"
+    fi
+    [ "$_wait" -ge "$_limit" ] && return 1
+    sleep 1
+    _wait=$(expr "$_wait" + 1)
+  done
+}
+
+set_usb_port_mode() {
+  echo "$1" > "$USB_MODE_FILE" 2>/dev/null || true
+}
+
 # Load configuration with safe defaults
 ETH_ENABLED=1
 ETH_FALLBACK_WIFI=1
@@ -32,6 +89,7 @@ ETH_IP=""
 ETH_NETMASK=""
 ETH_GATEWAY=""
 ETH_DNS=""
+USB_WIFI_SETUP=1
 
 load_config() {
   if [ -f "$CONF" ]; then
@@ -40,6 +98,9 @@ load_config() {
       key=$(echo "$key" | tr -d ' \t\r\n')
       val=$(echo "$val" | tr -d '\r\n"')
       case "$key" in
+        ETH_ENABLED) case "$val" in 0|1) ETH_ENABLED="$val" ;; esac ;;
+        ETH_FALLBACK_WIFI) case "$val" in 0|1) ETH_FALLBACK_WIFI="$val" ;; esac ;;
+        USB_WIFI_SETUP) case "$val" in 0|1) USB_WIFI_SETUP="$val" ;; esac ;;
         ETH_MODE) ETH_MODE="$val" ;;
         ETH_IP) ETH_IP="$val" ;;
         ETH_NETMASK) ETH_NETMASK="$val" ;;
@@ -50,6 +111,21 @@ load_config() {
   fi
 }
 load_config
+
+# ETH_DNS may list several servers (space or comma separated): one nameserver line each.
+# Only blanks or commas leave /etc/resolv.conf alone (printf wrote an empty "nameserver" line);
+# set -f keeps a "*" in the value from expanding to file names.
+write_resolv_conf() {
+  _resolv=""
+  set -f
+  for _dns in $(echo "$ETH_DNS" | tr ',' ' '); do
+    _resolv="${_resolv}nameserver $_dns
+"
+  done
+  set +f
+  [ -n "$_resolv" ] || return 0
+  printf '%s' "$_resolv" > /etc/resolv.conf
+}
 
 configure_arp_isolation() {
   # Prevent ARP flux and broadcast loops when both eth and wifi are on same subnet
@@ -98,19 +174,6 @@ find_eth_interface() {
   return 1
 }
 
-is_wifi_configured() {
-  if [ -f "$WPA_CONF" ] && grep -q 'network=' "$WPA_CONF" 2>/dev/null; then
-    return 0
-  fi
-  if [ -f /etc/wpa_supplicant.conf ] && grep -q 'network=' /etc/wpa_supplicant.conf 2>/dev/null; then
-    return 0
-  fi
-  if [ -f /etc/wpa_supplicant.ath0.conf ] && grep -q 'network=' /etc/wpa_supplicant.ath0.conf 2>/dev/null; then
-    return 0
-  fi
-  return 1
-}
-
 ensure_wifi() {
   load_config
   log "Ensuring Wi-Fi connection (ath0)..."
@@ -139,11 +202,10 @@ ensure_wifi() {
           log "Configuring static IP $ETH_IP on ath0..."
           ifconfig ath0 "$ETH_IP" netmask "${ETH_NETMASK:-255.255.255.0}" up 2>/dev/null || true
           [ -n "$ETH_GATEWAY" ] && route add default gw "$ETH_GATEWAY" dev ath0 2>/dev/null || true
-          [ -n "$ETH_DNS" ] && echo "nameserver $ETH_DNS" > /etc/resolv.conf
+          write_resolv_conf
           send_garp "ath0" "$ETH_IP"
         fi
         set_state "ath0:wifi:$ETH_IP"
-        stop_recovery_ap 2>/dev/null || true
         return 0
         ;;
     esac
@@ -166,7 +228,6 @@ ensure_wifi() {
   if [ -n "$wifi_ip" ]; then
     log "Wi-Fi connected successfully: ath0 has IP $wifi_ip"
     set_state "ath0:wifi:$wifi_ip"
-    stop_recovery_ap 2>/dev/null || true
     return 0
   else
     log "Wi-Fi IP lease pending in background"
@@ -251,10 +312,9 @@ start_eth() {
     if [ -n "$ETH_GATEWAY" ]; then
       route add default gw "$ETH_GATEWAY" dev "$eth_if" >> "$LOG" 2>&1
     fi
-    [ -n "$ETH_DNS" ] && echo "nameserver $ETH_DNS" > /etc/resolv.conf
+    write_resolv_conf
     send_garp "$eth_if" "$ETH_IP"
     set_state "$eth_if:ethernet:$ETH_IP"
-    stop_recovery_ap 2>/dev/null || true
     log "Ethernet configured statically: $eth_if has IP $ETH_IP"
     return 0
   else
@@ -272,7 +332,6 @@ start_eth() {
       route del default dev ath0 2>/dev/null || true
       send_garp "$eth_if" "$eth_ip"
       set_state "$eth_if:ethernet:$eth_ip"
-      stop_recovery_ap 2>/dev/null || true
       log "Ethernet connected via DHCP: $eth_if has IP $eth_ip"
       return 0
     else
@@ -297,9 +356,6 @@ stop_eth() {
 }
 
 monitor_wifi() {
-  # Skip while recovery AP is active
-  [ -f /var/run/hub-recovery-ap.pid ] && return 0
-
   # 1. Ensure ath0 interface exists and is up
   if ! ifconfig ath0 >/dev/null 2>&1; then
     log "ath0 missing, creating..."
@@ -522,14 +578,13 @@ migrate_to_ethernet() {
   fi
 
   # Restore DNS if configured
-  [ -n "$ETH_DNS" ] && echo "nameserver $ETH_DNS" > /etc/resolv.conf
+  write_resolv_conf
   [ -f /etc/resolv.conf ] && cp /etc/resolv.conf "/tmp/resolv.conf.$eth_if" 2>/dev/null || true
 
   configure_arp_isolation
   send_garp "$eth_if" "$target_ip"
   echo 1 > /tmp/eth_conn_pipe 2>/dev/null || true
   set_state "$eth_if:ethernet:$target_ip"
-  stop_recovery_ap 2>/dev/null || true
   log "Migration complete: Ethernet ($eth_if) active with IP $target_ip, GW $target_gw"
 }
 
@@ -572,7 +627,7 @@ migrate_to_wifi() {
   fi
 
   # Restore DNS if configured
-  [ -n "$ETH_DNS" ] && echo "nameserver $ETH_DNS" > /etc/resolv.conf
+  write_resolv_conf
   [ -f /etc/resolv.conf ] && cp /etc/resolv.conf "/tmp/resolv.conf.ath0" 2>/dev/null || true
 
   configure_arp_isolation
@@ -589,30 +644,6 @@ for s in /data/harmony/scripts/network_monitor.sh /data/harmony/network_monitor.
 done
 [ -n "$NET_MON_SCRIPT" ] && . "$NET_MON_SCRIPT"
 
-start_recovery_ap() {
-  log "Starting recovery captive portal AP..."
-  for s in /data/harmony/scripts/recovery_ap.sh /data/harmony/recovery_ap.sh /data/harmony/bin/recovery_ap.sh; do
-    if [ -x "$s" ]; then
-      "$s" start >> "$LOG" 2>&1 &
-      return 0
-    fi
-  done
-  log "Warning: recovery_ap.sh not found!"
-  return 1
-}
-
-stop_recovery_ap() {
-  if [ -f /var/run/hub-recovery-ap.pid ]; then
-    log "Stopping recovery AP..."
-    for s in /data/harmony/scripts/recovery_ap.sh /data/harmony/recovery_ap.sh /data/harmony/bin/recovery_ap.sh; do
-      if [ -x "$s" ]; then
-        "$s" stop >> "$LOG" 2>&1
-        return 0
-      fi
-    done
-  fi
-}
-
 do_boot() {
   log "Boot initialization started..."
   load_config
@@ -627,44 +658,36 @@ do_boot() {
   fi
 
   # 1. Initialize Wi-Fi immediately
-  has_wifi=0
-  if ensure_wifi; then
-    has_wifi=1
-  fi
+  ensure_wifi
 
   # 2. Initialize Ethernet (Onboard eth1 on Pro 2400, or USB Host mode on standard Hub)
-  has_eth=0
   if is_onboard_eth; then
     log "Starting Onboard Ethernet (eth1)..."
   else
     log "Starting Ethernet (USB Host mode)..."
   fi
 
-  if start_eth; then
+  if [ "$ETH_ENABLED" != "1" ]; then
+    # Ethernet turned off in the settings: the USB port stays in device mode
+    log "Ethernet is disabled in the settings; not starting it."
+    is_onboard_eth || set_usb_port_mode device
+    false
+  elif [ "$USB_WIFI_SETUP" = "1" ] && ! is_onboard_eth && usb_computer_attached; then
+    log "A computer is using the USB port: it stays a USB device for this boot (Wi-Fi setup over USB); Ethernet over USB is not started. Restart the Hub with the Ethernet adapter plugged in to use it."
+    set_usb_port_mode device
+    false
+  elif start_eth; then
     if is_onboard_eth; then
       log "Onboard Ethernet interface eth1 initialized on boot."
     else
       log "USB Ethernet adapter initialized on boot."
     fi
-    has_eth=1
-    stop_recovery_ap 2>/dev/null || true
   else
     log "No active Ethernet link on boot; evaluating Wi-Fi fallback."
     cur_eth=$(find_eth_interface)
     if [ "$ETH_FALLBACK_WIFI" = "1" ] && [ -n "$ETH_IP" ]; then
       log "ETH_FALLBACK_WIFI active: assigning static fallback IP $ETH_IP to ath0..."
       migrate_to_wifi "$cur_eth" "$ETH_IP" "${ETH_NETMASK:-255.255.255.0}" "$ETH_GATEWAY"
-      has_wifi=1
-    fi
-  fi
-
-  # If both Wi-Fi and Ethernet are offline AND Wi-Fi has no credentials, activate recovery AP
-  if [ "$has_wifi" -eq 0 ] && [ "$has_eth" -eq 0 ]; then
-    if ! is_wifi_configured; then
-      log "No active network link and no Wi-Fi credentials found on boot. Spawning recovery AP captive portal..."
-      start_recovery_ap
-    else
-      log "Wi-Fi is configured (association/DHCP pending). Skipping recovery AP; dynamic monitor will maintain link."
     fi
   fi
 
@@ -682,7 +705,8 @@ do_apply() {
     rm -f /var/run/udhcpc.*.pid
   fi
 
-  cur_eth=$(find_eth_interface)
+  cur_eth=""
+  [ "$ETH_ENABLED" = "1" ] && cur_eth=$(find_eth_interface)
   if [ -n "$cur_eth" ]; then
     cfile="/sys/class/net/$cur_eth/carrier"
     if [ -f "$cfile" ] && [ "$(cat "$cfile" 2>/dev/null)" = "1" ]; then
@@ -715,12 +739,6 @@ case "$1" in
   ensure_wifi)
     ensure_wifi
     ;;
-  start_recovery_ap)
-    start_recovery_ap
-    ;;
-  stop_recovery_ap)
-    stop_recovery_ap
-    ;;
   monitor)
     run_monitor
     ;;
@@ -734,7 +752,6 @@ case "$1" in
     load_config
     echo "ETH_ENABLED=$ETH_ENABLED"
     echo "ETH_FALLBACK_WIFI=$ETH_FALLBACK_WIFI"
-    echo "ETH_USB_SERIAL=$ETH_USB_SERIAL"
     echo "ETH_MODE=$ETH_MODE"
     cat "$STATE_FILE" 2>/dev/null
     ;;

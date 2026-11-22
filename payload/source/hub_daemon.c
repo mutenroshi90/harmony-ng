@@ -17,8 +17,10 @@
 #include "hub_ntp.h"
 #include "http_api_system.h"
 #include "http_api_remotes.h"
+#include "http_api_ota.h"
 #include "hub_key_channel.h"
 #include "harmony_version.h"
+#include "wifi_config.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -214,6 +216,9 @@ int main(int argc, char **argv) {
 
     /* 1. Hardware, Config Store & Orchestrator Core */
     config_store_init();
+    ota_update_state_init();
+    /* a Wi-Fi test (web UI or USB setup) cut short by a kill or a power cut: previous files back */
+    wifi_config_recover();
     /* Rewrite VERSION only when it differs: every daemon start wrote it to flash */
     char cur_ver[64] = {0};
     FILE *cvf = fopen("/data/harmony/VERSION", "r");
@@ -223,10 +228,8 @@ int main(int argc, char **argv) {
         cur_ver[strcspn(cur_ver, "\r\n")] = '\0';
     }
     if (strcmp(cur_ver, HARMONY_VERSION) != 0) {
-        FILE *vf = fopen("/data/harmony/VERSION", "w");
-        if (vf) {
-            fprintf(vf, "%s\n", HARMONY_VERSION);
-            fclose(vf);
+        if (write_file_atomic("/data/harmony/VERSION", HARMONY_VERSION "\n") != 0) {
+            fprintf(stderr, "[-] Could not write /data/harmony/VERSION\n");
         }
     }
     hub_info_init(mfg_file);
