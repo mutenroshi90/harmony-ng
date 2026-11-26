@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
 #include "hw_action.h"
+#include "cmd_range.h"
+#include "cmd_ir_alt.h"
 #include "resource_cache.h"
 #include "ir_encoder.h"
 #include "ir_i2s.h"
@@ -7,6 +9,10 @@
 #include "bt_common.h"
 #include "orchestrator.h"
 #include "hub_events.h"
+#include "ble_adv_payload.h"
+#include "plugin_mgr.h"
+#include "net_device.h"
+#include "net_action.h"
 #include "cJSON.h"
 
 #include <stdio.h>
@@ -16,12 +22,33 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <poll.h>
+
+/* The Hub's name for plugins: read on every plugin command, so kept here instead of reading
+ * settings.json each time. A short copy under the lock. */
+static pthread_mutex_t s_hub_name_lock = PTHREAD_MUTEX_INITIALIZER;
+static char s_hub_name[64] = HW_HUB_NAME_DEFAULT;
+
+void hw_set_hub_name(const char *name) {
+    /* "Harmony Hub" is the stored default when the user never named the Hub: the stock name */
+    const char *n = (name && name[0] && strcmp(name, "Harmony Hub") != 0) ? name : HW_HUB_NAME_DEFAULT;
+    pthread_mutex_lock(&s_hub_name_lock);
+    snprintf(s_hub_name, sizeof(s_hub_name), "%s", n);
+    pthread_mutex_unlock(&s_hub_name_lock);
+}
+
+void hw_get_hub_name(char *out, size_t len) {
+    if (!out || !len) return;
+    pthread_mutex_lock(&s_hub_name_lock);
+    snprintf(out, len, "%s", s_hub_name);
+    pthread_mutex_unlock(&s_hub_name_lock);
+}
 
 /*
  * Held IR key. A press hands the encoded code to one player thread and returns. The thread
@@ -30,8 +57,13 @@
  * released, when no hold (the remote's heartbeat while the key is down) came for
  * HW_IR_HOLD_DEADLINE_MS, or when another command needs the transmitter; then it sends the
  * finish sequence if the code has one. It always ends after a whole frame and never before the
- * start sequence is out, so a quick tap still sends what a tap sends. The command lock is not
- * held while it plays, so the release gets in.
+ * start sequence and the press's minimum repeat parts are out (ir_press_repeat_parts(): the
+ * device's pressMinRepeats, as on a stock Hub), so a quick tap still sends what a tap sends.
+ * The command lock is not held while it plays, so the release gets in.
+ *
+ * A tap of a code with repeat parts is played by the same thread with the key already
+ * released: the caller waits for it, and every other sender waits for it like for a held key,
+ * so nothing gets between the frames of one press.
  *
  * No condition variables: the Hub's kernel has no futex system call, so pthread_cond_wait()
  * returns at once and a thread waiting on one spins at full CPU. The player sleeps in poll()
@@ -49,7 +81,11 @@ static struct {
     uint8_t *blob;
     size_t blob_len;
     uint8_t ports;
-} s_ir_hold = { PTHREAD_MUTEX_INITIALIZER, -1, -1, 0, 0, 0, 0, {0}, NULL, 0, 0 };
+    int min_parts;          /* repeat parts that go out before it may end */
+    unsigned job;           /* counts the keys handed over */
+    unsigned job_done;      /* the last key that ended */
+    int job_rc;             /* its result: 0, or the failed send's */
+} s_ir_hold = { PTHREAD_MUTEX_INITIALIZER, -1, -1, 0, 0, 0, 0, {0}, NULL, 0, 0, 0, 0, 0, 0 };
 
 static uint64_t ir_hold_now_ms(void) {
     struct timespec ts;
@@ -89,20 +125,30 @@ static void *ir_hold_thread(void *arg) {
         uint8_t *blob = s_ir_hold.blob;
         size_t blob_len = s_ir_hold.blob_len;
         uint8_t ports = s_ir_hold.ports;
+        int min_parts = s_ir_hold.min_parts;
+        unsigned job = s_ir_hold.job;
         pthread_mutex_unlock(&s_ir_hold.lock);
 
         /* one send for the capture mode, from the first frame to the last */
         ir_i2s_tx_hold(1);
-        int part = IR_BLOB_START, frames = 0, rc, timed_out = 0;
+        int part = IR_BLOB_START, frames = 0, repeats = 0, rc, timed_out = 0;
         for (;;) {
             rc = ir_i2s_blast_blob_part(blob, blob_len, part, ports);
             if (rc != 0) break;
             frames++;
+            if (part == IR_BLOB_REPEAT) repeats++;
             pthread_mutex_lock(&s_ir_hold.lock);
             int stop = s_ir_hold.stop;
-            if (!stop && ir_hold_now_ms() >= s_ir_hold.deadline_ms) timed_out = 1;
+            int late = ir_hold_now_ms() >= s_ir_hold.deadline_ms;
             pthread_mutex_unlock(&s_ir_hold.lock);
-            if (stop || timed_out) break;
+            /* a release or a lost hold ends it only once the press's minimum is out */
+            if (repeats >= min_parts) {
+                if (stop) break;
+                if (late) {
+                    timed_out = 1;
+                    break;
+                }
+            }
             part = IR_BLOB_REPEAT;
         }
         if (rc == 0) ir_i2s_blast_blob_part(blob, blob_len, IR_BLOB_FINISH, ports); /* -ENOENT: the code has none */
@@ -117,6 +163,8 @@ static void *ir_hold_thread(void *arg) {
         }
         ir_free_encoded(blob);
         s_ir_hold.blob = NULL;
+        s_ir_hold.job_rc = rc;
+        s_ir_hold.job_done = job;
         s_ir_hold.active = 0;
     }
     return NULL;
@@ -130,8 +178,11 @@ static void ir_hold_stop_wait(void) {
 }
 
 /* Starts a held key; the player frees blob. A key still playing ends first (its frame on air
- * goes out whole). -1 without a player thread: blob stays the caller's. */
-static int ir_hold_press(const char *key, uint8_t *blob, size_t blob_len, uint8_t ports) {
+ * goes out whole). min_parts: repeat parts it sends even when released at once; released: a tap,
+ * the key is released already. *job_out gets the key's number. -1 without a player thread:
+ * blob stays the caller's. */
+static int ir_hold_press(const char *key, uint8_t *blob, size_t blob_len, uint8_t ports, int min_parts,
+                         int released, unsigned *job_out) {
     pthread_mutex_lock(&s_ir_hold.lock);
     if (!s_ir_hold.thread_up) {
         if (s_ir_hold.wake_rd < 0) {
@@ -165,12 +216,28 @@ static int ir_hold_press(const char *key, uint8_t *blob, size_t blob_len, uint8_
     s_ir_hold.blob = blob;
     s_ir_hold.blob_len = blob_len;
     s_ir_hold.ports = ports;
+    s_ir_hold.min_parts = min_parts;
     s_ir_hold.deadline_ms = ir_hold_now_ms() + HW_IR_HOLD_DEADLINE_MS;
-    s_ir_hold.stop = 0;
+    s_ir_hold.stop = released ? 1 : 0;
+    s_ir_hold.job++;
+    if (job_out) *job_out = s_ir_hold.job;
     s_ir_hold.active = 1;
     if (write(s_ir_hold.wake_wr, "k", 1) < 0) { /* full pipe: a byte is already waiting */ }
     pthread_mutex_unlock(&s_ir_hold.lock);
     return 0;
+}
+
+/* Returns when key number job has ended, with its result */
+static int ir_hold_wait_job(unsigned job) {
+    pthread_mutex_lock(&s_ir_hold.lock);
+    while ((int)(s_ir_hold.job_done - job) < 0) {
+        pthread_mutex_unlock(&s_ir_hold.lock);
+        usleep(IR_HOLD_IDLE_POLL_US);
+        pthread_mutex_lock(&s_ir_hold.lock);
+    }
+    int rc = s_ir_hold.job_rc;
+    pthread_mutex_unlock(&s_ir_hold.lock);
+    return rc;
 }
 
 /* The hold of the key that is playing: it goes on for another HW_IR_HOLD_DEADLINE_MS. A hold
@@ -298,26 +365,81 @@ int hw_ir_cancel(uint8_t ports) {
     return 0;
 }
 
-/* held_key NULL: one blocking send of the code's start sequence (a tap, a sequence step).
- * Else the press of that key: the send starts and goes on in the player. */
-static int ir_send_keycode(const char *keycode, uint8_t ports, uint8_t repeats, const char *held_key) {
+/* The parts of one press without the player thread: the start, parts repeat parts, the finish */
+static int ir_play_press(const uint8_t *blob, size_t blob_len, uint8_t ports, int parts) {
+    ir_i2s_tx_hold(1);
+    int rc = ir_i2s_blast_blob_part(blob, blob_len, IR_BLOB_START, ports);
+    for (int i = 0; rc == 0 && i < parts; i++) rc = ir_i2s_blast_blob_part(blob, blob_len, IR_BLOB_REPEAT, ports);
+    if (rc == 0) ir_i2s_blast_blob_part(blob, blob_len, IR_BLOB_FINISH, ports); /* -ENOENT: the code has none */
+    ir_i2s_tx_hold(0);
+    return rc;
+}
+
+/* The RC5 toggle bit, as a stock Hub keeps it (device.lua toggleByte): one per device and
+ * protocol, 0 after a start. A press or tap sends the stored bit and then flips it, so a
+ * receiver tells a new press of a key from the key held; a held key's repeats are that
+ * press's frames and keep its bit. No device (a keycode sent on its own): 0, as stored. */
+#define RC5_TOGGLE_MAX 32
+static struct { char key[128]; int bit; } s_rc5_toggles[RC5_TOGGLE_MAX];
+static pthread_mutex_t s_rc5_toggle_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int rc5_toggle_take(const char *device_id, const char *keycode) {
+    if (!device_id || !device_id[0] || !ir_keycode_is_rc5_toggle(keycode)) return 0;
+    char key[sizeof(s_rc5_toggles[0].key)];
+    snprintf(key, sizeof(key), "%s/%.*s", device_id, (int)strcspn(keycode + 2, ":"), keycode + 2);
+    int bit = 0;
+    pthread_mutex_lock(&s_rc5_toggle_lock);
+    for (int i = 0; i < RC5_TOGGLE_MAX; i++) {
+        if (!s_rc5_toggles[i].key[0]) snprintf(s_rc5_toggles[i].key, sizeof(s_rc5_toggles[i].key), "%s", key);
+        if (strcmp(s_rc5_toggles[i].key, key) == 0) {
+            bit = s_rc5_toggles[i].bit;
+            s_rc5_toggles[i].bit = !bit;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&s_rc5_toggle_lock);
+    return bit; /* more than RC5_TOGGLE_MAX devices with RC5: the others send the code as stored */
+}
+
+/* press 0: one blocking send of the code's start sequence, as given (a fallback for a step that
+ * names a raw or Pronto code). press 1: a press as a stock Hub sends it, the start part then
+ * ir_press_repeat_parts() repeat parts for the device's press_min_repeats (negative: not set);
+ * held_key NULL: a tap, it returns when the press is out; else the press of that key: the send
+ * starts and goes on in the player until the release. device_id: the device the code belongs
+ * to, for its RC5 toggle bit; NULL: the code goes out as stored. */
+static int ir_send_keycode(const char *keycode, uint8_t ports, uint8_t repeats, int press, int press_min_repeats,
+                           const char *held_key, const char *device_id) {
     if (!keycode || !keycode[0]) return -1;
     if (ports == 0) return 0; /* 0 = No blasters / IR disabled */
 
     uint8_t *bin = NULL;
     size_t bin_len = 0;
-    int rc = ir_encode_harmony_keycode(keycode, repeats ? repeats : 3, &bin, &bin_len);
+    int rc = ir_encode_harmony_keycode_toggle(keycode, repeats ? repeats : 3, rc5_toggle_take(device_id, keycode),
+                                              &bin, &bin_len);
     if (rc != 0 || !bin || bin_len == 0) {
         return -2;
     }
+    int parts = press ? ir_press_repeat_parts(keycode, bin, bin_len, press_min_repeats) : 0;
 
     uint8_t port_mask = ports;
     if (g_dry_run) {
-        printf("[DRY-RUN] IR Keycode simulated: %s (%zu bytes), port_mask 0x%02x\n", keycode, bin_len, port_mask);
+        printf("[DRY-RUN] IR Keycode simulated: %s (%zu bytes), port_mask 0x%02x, %d repeat part(s) per press\n",
+               keycode, bin_len, port_mask, parts);
         ir_free_encoded(bin);
         return 0;
     }
-    if (held_key && ir_hold_press(held_key, bin, bin_len, port_mask) == 0) return 0;
+    unsigned job = 0;
+    if (held_key && ir_hold_press(held_key, bin, bin_len, port_mask, parts, 0, NULL) == 0) return 0;
+    if (parts > 0) {
+        /* the player sends the whole press, so no other send gets between its frames */
+        if (ir_hold_press(held_key ? held_key : keycode, bin, bin_len, port_mask, parts, 1, &job) == 0) {
+            return ir_hold_wait_job(job);
+        }
+        ir_hold_stop_wait(); /* a held key ends for this send */
+        int ret = ir_play_press(bin, bin_len, port_mask, parts);
+        ir_free_encoded(bin);
+        return ret;
+    }
     ir_hold_stop_wait(); /* a held key ends for this send */
     int ret = ir_i2s_blast_blob(bin, bin_len, port_mask);
 
@@ -326,7 +448,7 @@ static int ir_send_keycode(const char *keycode, uint8_t ports, uint8_t repeats, 
 }
 
 int hw_ir_send_harmony_keycode(const char *keycode, uint8_t ports, uint8_t repeats) {
-    return ir_send_keycode(keycode, ports, repeats, NULL);
+    return ir_send_keycode(keycode, ports, repeats, 0, -1, NULL, NULL);
 }
 
 static int is_bt_device_connected(const char *target_bdaddr) {
@@ -567,7 +689,46 @@ static void check_and_trigger_bt_reconnect_for_command(const cJSON *devs, const 
     }
 }
 
-static int send_match_in(const cJSON *root, const char *target, int match_mode, const char *command, int action) {
+/* One command as infrared: the code of an IR device's command, or the infrared alternative of a
+ * plugin device's command (cmd_ir_alt.h). A press starts the code and returns; the player
+ * repeats it until the release. A hold is only the heartbeat of the key that plays and sends
+ * nothing itself: each one used to be another blocking send, so a held key reached the device as
+ * separate bursts. default_repeats: when the command has no "repeats" (1..20). */
+static int send_ir_command(const cJSON *target_dev, const cJSON *target_cmd, const char *keycode, uint8_t ir_ports,
+                           const char *dev_id, const char *command, int action, uint8_t default_repeats) {
+    char held_key[200];
+    snprintf(held_key, sizeof(held_key), "%s/%s", dev_id, command);
+    if (action == HW_BTN_ACTION_RELEASE) {
+        ir_hold_release(held_key);
+        return 0;
+    }
+    if (action == HW_BTN_ACTION_REPEAT) {
+        ir_hold_heartbeat(held_key);
+        return 0;
+    }
+    uint8_t repeats = default_repeats;
+    cJSON *j_rep = cJSON_GetObjectItemCaseSensitive(target_cmd, "repeats");
+    if (j_rep && cJSON_IsNumber(j_rep) && j_rep->valuedouble > 0 && j_rep->valuedouble <= 20) {
+        repeats = (uint8_t)j_rep->valuedouble;
+    }
+    /* The command's "repeats" is kept in the code's header only: how many frames a press
+     * sends comes from the device's pressMinRepeats, as on a stock Hub */
+    int press_min_repeats = -1; /* not set: IR_PRESS_MIN_REPEATS_DEFAULT */
+    cJSON *j_pmr = cJSON_GetObjectItemCaseSensitive(target_dev, "pressMinRepeats");
+    if (cJSON_IsNumber(j_pmr) && j_pmr->valuedouble >= 0 && j_pmr->valuedouble <= IR_PRESS_MIN_REPEATS_MAX) {
+        press_min_repeats = (int)j_pmr->valuedouble;
+    }
+    /* a command's own port (Emitter Port of the saved command) before the device's */
+    uint8_t cmd_ports = ir_ports;
+    cJSON *j_cport = cJSON_GetObjectItemCaseSensitive(target_cmd, "port");
+    if (cJSON_IsNumber(j_cport) && j_cport->valuedouble >= 1 && j_cport->valuedouble <= 7) {
+        cmd_ports = (uint8_t)j_cport->valuedouble;
+    }
+    return ir_send_keycode(keycode, cmd_ports, repeats, 1, press_min_repeats,
+                           action == HW_BTN_ACTION_PRESS ? held_key : NULL, dev_id);
+}
+
+static int send_match_in(const cJSON *root, const char *target, int match_mode, const char *command, int action, int value) {
     int ret = -1;
 
     cJSON *devs = cJSON_GetObjectItemCaseSensitive(root, "devices");
@@ -632,6 +793,16 @@ static int send_match_in(const cJSON *root, const char *target, int match_mode, 
     cJSON *j_mtop = cJSON_GetObjectItemCaseSensitive(target_dev, "mqttTopic");
     if (j_mtop && cJSON_IsString(j_mtop) && j_mtop->valuestring && j_mtop->valuestring[0]) is_mqtt = 1;
 
+    /* Only the device's "plugin" field or "plugin:<id>" type: no manifest is read in the key
+     * path, and an IR device whose type happens to match a plugin name stays IR */
+    char plugin_id[64] = {0};
+    int is_plugin = plugin_mgr_device_plugin_id(target_dev, plugin_id, sizeof(plugin_id));
+    const int dev_is_plugin = is_plugin; /* the device itself, not a PLUGIN: keyCode below */
+    /* HTTP and TCP devices by their type only (net_device.h): a name with "mqtt" in it does
+     * not make one an MQTT device */
+    int net_kind = is_plugin ? NET_KIND_NONE : net_device_kind(target_dev);
+    if (net_kind) is_mqtt = 0;
+
     /* Find Command */
     cJSON *cmds = cJSON_GetObjectItemCaseSensitive(target_dev, "commands");
     cJSON *target_cmd = NULL;
@@ -664,7 +835,7 @@ static int send_match_in(const cJSON *root, const char *target, int match_mode, 
         }
     }
 
-    if (!target_cmd && !is_mqtt) {
+    if (!target_cmd && !is_mqtt && !is_plugin) {
         return -6;
     }
 
@@ -685,7 +856,47 @@ static int send_match_in(const cJSON *root, const char *target, int match_mode, 
         }
     }
 
+    /* Points into the saved keyCode (held until the send is done): a copy cut long app links */
+    const char *plug_cmd = command;
+    if (strncmp(keycode_str, "PLUGIN:", 7) == 0 || strncmp(keycode_str, "plugin:", 7) == 0) {
+        is_plugin = 1;
+        const char *p = keycode_str + 7;
+        const char *colon = strchr(p, ':');
+        if (colon) {
+            size_t plen = (size_t)(colon - p);
+            if (plen < sizeof(plugin_id)) {
+                memcpy(plugin_id, p, plen);
+                plugin_id[plen] = '\0';
+            }
+            if (colon[1]) plug_cmd = colon + 1;
+        } else if (!plugin_id[0]) {
+            strncpy(plugin_id, p, sizeof(plugin_id) - 1);
+        }
+    }
+
     if (strncmp(keycode_str, "G:MQTT", 6) == 0) is_mqtt = 1;
+
+    /* The infrared alternative of a plugin device's command: while the device's config field
+     * named by the command's irWhen is on, the command goes out as infrared with irKeyCode, the
+     * way an IR device's command does (a TV that ignores some keys over its network API). Only
+     * the device as held in memory is read: no file in the key path. */
+    const char *ir_alt_code = (dev_is_plugin && target_cmd) ? cmd_ir_alt_active(target_dev, target_cmd) : NULL;
+    if (ir_alt_code) is_plugin = 0;
+
+    /* A plugin command with "range": [min, max] takes only a value in that range, and needs one */
+    if (is_plugin && target_cmd && cmd_range_valid(cJSON_GetObjectItemCaseSensitive(target_cmd, "range"))) {
+        if (value == HW_VALUE_NONE) {
+            printf("[!] Command '%s' of device '%s' refused: it needs a value (it has a range)\n",
+                   command, dev_name[0] ? dev_name : target);
+            return HW_ERR_VALUE_MISSING;
+        }
+        if (!hw_command_value_in_range(target_cmd, value)) {
+            printf("[!] Command '%s' of device '%s' refused: value %d outside its range\n",
+                   command, dev_name[0] ? dev_name : target, value);
+            return HW_ERR_VALUE_RANGE;
+        }
+    }
+    if (value == HW_VALUE_NONE) value = 0;
 
     uint8_t ir_ports = IR_PORT_ALL;
     cJSON *j_cp = cJSON_GetObjectItemCaseSensitive(target_dev, "controlPort");
@@ -773,7 +984,40 @@ static int send_match_in(const cJSON *root, const char *target, int match_mode, 
         }
     }
 
-    if (is_bt) {
+    int is_ble_adv = (strncmp(keycode_str, BLE_ADV_KEYCODE_PREFIX, BLE_ADV_KEYCODE_PREFIX_LEN) == 0);
+
+    if (ir_alt_code) {
+        /* repeats as a command of an IR device gets when it has none (config_sanitize.c) */
+        ret = send_ir_command(target_dev, target_cmd, ir_alt_code, ir_ports, actual_dev_id, command, action, 3);
+    } else if (is_plugin && plugin_id[0]) {
+        cJSON *j_cfg = cJSON_GetObjectItemCaseSensitive(target_dev, "config");
+        ret = hw_plugin_command_send(plugin_id, actual_dev_id, dev_name, plug_cmd, action, value, j_cfg ? j_cfg : target_dev);
+    } else if (net_kind) {
+        /* One request per press, like a BLE broadcast: the remote sends a hold every 300 ms, so
+         * a repeat would send a toggle (Power) twice. Queued for the net_action worker, so a slow
+         * device never holds this lock. */
+        ret = (action == HW_BTN_ACTION_RELEASE || action == HW_BTN_ACTION_REPEAT) ? 0 :
+              net_action_send(target_dev, target_cmd, actual_dev_id, dev_name, command, g_live_remote_key);
+        if (ret == -3) ret = HW_ERR_QUEUE_FULL; /* -3 is also an infrared sender's code */
+    } else if (is_ble_adv) {
+        /* One broadcast per press: the receiver acts on the packet, not on how long it is held */
+        if (action == HW_BTN_ACTION_RELEASE || action == HW_BTN_ACTION_REPEAT) {
+            ret = 0;
+        } else {
+            const char *hex = keycode_str + BLE_ADV_KEYCODE_PREFIX_LEN;
+            uint8_t adv[BLE_ADV_MAX_LEN];
+            int adv_len = ble_adv_parse_hex(hex, adv, NULL);
+            if (adv_len < 0) {
+                printf("[!] BLE broadcast '%s' skipped: Device '%s' (%s) has an invalid payload\n",
+                       command, dev_name[0] ? dev_name : "BLE-Device", actual_dev_id);
+                ret = -2;
+            } else {
+                char adv_cmd[8 + 2 * BLE_ADV_MAX_LEN];
+                snprintf(adv_cmd, sizeof(adv_cmd), "adv %.*s\n", 2 * adv_len, hex);
+                ret = hub_send_btstack_cmd(adv_cmd);
+            }
+        }
+    } else if (is_bt) {
         if (!bdaddr[0]) {
             pthread_mutex_unlock(&s_hw_cmd_lock);
             printf("[!] BT command '%s' skipped: Device '%s' (%s) has no host paired\n",
@@ -943,25 +1187,7 @@ static int send_match_in(const cJSON *root, const char *target, int match_mode, 
         }
         ret = 0;
     } else if (keycode_str[0]) {
-        /* A press starts the code and returns; the player repeats it until the release. A hold
-         * is only the heartbeat of the key that plays and sends nothing itself: each one used to
-         * be another blocking send, so a held key reached the device as separate bursts. */
-        char held_key[200];
-        snprintf(held_key, sizeof(held_key), "%s/%s", actual_dev_id, command);
-        if (action == HW_BTN_ACTION_RELEASE) {
-            ir_hold_release(held_key);
-            ret = 0;
-        } else if (action == HW_BTN_ACTION_REPEAT) {
-            ir_hold_heartbeat(held_key);
-            ret = 0;
-        } else {
-            uint8_t repeats = 1;
-            cJSON *j_rep = cJSON_GetObjectItemCaseSensitive(target_cmd, "repeats");
-            if (j_rep && cJSON_IsNumber(j_rep) && j_rep->valuedouble > 0 && j_rep->valuedouble <= 20) {
-                repeats = (uint8_t)j_rep->valuedouble;
-            }
-            ret = ir_send_keycode(keycode_str, ir_ports, repeats, action == HW_BTN_ACTION_PRESS ? held_key : NULL);
-        }
+        ret = send_ir_command(target_dev, target_cmd, keycode_str, ir_ports, actual_dev_id, command, action, 1);
     }
 
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -975,7 +1201,38 @@ static int send_match_in(const cJSON *root, const char *target, int match_mode, 
     return ret;
 }
 
-static int hw_device_command_send_match(const char *target, int match_mode, const char *command, int action) {
+int hw_command_value_in_range(const cJSON *cmd, int value) {
+    const cJSON *r = cJSON_GetObjectItemCaseSensitive(cmd, "range");
+    if (!cmd_range_valid(r)) return 1;
+    return value >= cJSON_GetArrayItem(r, 0)->valueint && value <= cJSON_GetArrayItem(r, 1)->valueint;
+}
+
+int hw_device_command_needs_value(const char *target, int match_mode, const char *command) {
+    if (!target || !command) return 0;
+    struct cfg_snap *snap = NULL;
+    const cJSON *root = get_device_list_acquire(&snap);
+    if (!root) return 0;
+    int needs = 0;
+    const cJSON *devs = cJSON_GetObjectItemCaseSensitive(root, "devices");
+    const cJSON *dev = cJSON_IsArray(devs) ? find_device(devs, target, match_mode, NULL, 0) : NULL;
+    const cJSON *c = NULL;
+    cJSON_ArrayForEach(c, (dev ? cJSON_GetObjectItemCaseSensitive(dev, "commands") : NULL)) {
+        const cJSON *cn = cJSON_GetObjectItemCaseSensitive(c, "name");
+        if (!cJSON_IsString(cn) || strcasecmp(cn->valuestring, command) != 0) continue;
+        const cJSON *kc = cJSON_GetObjectItemCaseSensitive(c, "keyCode");
+        if (!cJSON_IsString(kc)) kc = cJSON_GetObjectItemCaseSensitive(c, "raw");
+        int plugin = plugin_mgr_device_plugin_id(dev, NULL, 0) ||
+                     (cJSON_IsString(kc) && strncasecmp(kc->valuestring, "PLUGIN:", 7) == 0);
+        /* A command sent as infrared ignores the value: no value needed while its switch is on */
+        needs = plugin && !cmd_ir_alt_active(dev, c) &&
+                cmd_range_valid(cJSON_GetObjectItemCaseSensitive(c, "range"));
+        break;
+    }
+    release_device_list(&snap);
+    return needs;
+}
+
+static int hw_device_command_send_match(const char *target, int match_mode, const char *command, int action, int value) {
     if (!target || !command) return -1;
 
     /* The shared device list (no copy per key): a save meanwhile publishes a new one and leaves
@@ -983,25 +1240,29 @@ static int hw_device_command_send_match(const char *target, int match_mode, cons
     struct cfg_snap *snap = NULL;
     const cJSON *root = get_device_list_acquire(&snap);
     if (!root) return -4;
-    int ret = send_match_in(root, target, match_mode, command, action);
+    int ret = send_match_in(root, target, match_mode, command, action, value);
     release_device_list(&snap);
     return ret;
 }
 
 int hw_device_command_send_action(const char *target, int match_mode, const char *command, int action) {
-    return hw_device_command_send_match(target, match_mode, command, action);
+    return hw_device_command_send_match(target, match_mode, command, action, HW_VALUE_NONE);
+}
+
+int hw_device_command_send_value(const char *target, int match_mode, const char *command, int action, int value) {
+    return hw_device_command_send_match(target, match_mode, command, action, value);
 }
 
 int hw_device_command_send(const char *device_id, const char *command) {
-    return hw_device_command_send_match(device_id, 0, command, HW_BTN_ACTION_TAP);
+    return hw_device_command_send_match(device_id, 0, command, HW_BTN_ACTION_TAP, HW_VALUE_NONE);
 }
 
 int hw_device_command_send_by_id(const char *device_id, const char *command) {
-    return hw_device_command_send_match(device_id, 1, command, HW_BTN_ACTION_TAP);
+    return hw_device_command_send_match(device_id, 1, command, HW_BTN_ACTION_TAP, HW_VALUE_NONE);
 }
 
 int hw_device_command_send_by_name(const char *device_name, const char *command) {
-    return hw_device_command_send_match(device_name, 2, command, HW_BTN_ACTION_TAP);
+    return hw_device_command_send_match(device_name, 2, command, HW_BTN_ACTION_TAP, HW_VALUE_NONE);
 }
 
 static int device_exists_in(const cJSON *root, const char *target, int match_mode) {
@@ -1039,7 +1300,7 @@ static int device_command_exists_in(const cJSON *root, const char *target, int m
     if (j_dmfg && cJSON_IsString(j_dmfg) && strcasestr(j_dmfg->valuestring, "mqtt")) is_mqtt = 1;
     cJSON *j_mtop = cJSON_GetObjectItemCaseSensitive(target_dev, "mqttTopic");
     if (j_mtop && cJSON_IsString(j_mtop) && j_mtop->valuestring && j_mtop->valuestring[0]) is_mqtt = 1;
-    if (is_mqtt) return 1;
+    if (is_mqtt && !net_device_kind(target_dev)) return 1;
 
     /* Connect and Disconnect are found in the list like any command, as the sender looks them
      * up (the sanitizer adds both to every Bluetooth device). Accepted for any device, a job
@@ -1172,4 +1433,76 @@ int hw_bt_release_all(void) {
     ssize_t w = write(fd, "RELEASE\n", 8);
     close(fd);
     return (w == 8) ? 0 : -1;
+}
+
+int hw_plugin_command_send(const char *plugin_id, const char *dev_id, const char *dev_name,
+                          const char *command, int action, int value, const cJSON *config) {
+    /* the id goes into the socket path */
+    if (!plugin_mgr_is_safe_id(plugin_id) || !command || !command[0]) return -1;
+
+    char sock_path[128];
+    snprintf(sock_path, sizeof(sock_path), HARMONY_PLUGINS_RUN_DIR "/%s.sock", plugin_id);
+
+    const char *action_str = "press";
+    if (action == HW_BTN_ACTION_RELEASE) action_str = "release";
+    else if (action == HW_BTN_ACTION_REPEAT) action_str = "repeat";
+    else if (action == HW_BTN_ACTION_TAP) action_str = "tap";
+
+    char hub_name[64];
+    hw_get_hub_name(hub_name, sizeof(hub_name));
+    if (g_dry_run) {
+        printf("[DRY-RUN] Plugin command simulated: plugin=%s dev=%s (%s) cmd=%s action=%s val=%d hub=%s sock=%s\n",
+               plugin_id, dev_id ? dev_id : "", dev_name ? dev_name : "", command, action_str, value, hub_name, sock_path);
+        return 0;
+    }
+
+    int s = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (s < 0) return -1;
+
+    struct sockaddr_un sun;
+    memset(&sun, 0, sizeof(sun));
+    sun.sun_family = AF_UNIX;
+    strncpy(sun.sun_path, sock_path, sizeof(sun.sun_path) - 1);
+
+    cJSON *msg = cJSON_CreateObject();
+    if (msg) {
+        cJSON_AddStringToObject(msg, "plugin_id", plugin_id);
+        cJSON_AddStringToObject(msg, "hub_name", hub_name);
+        cJSON_AddStringToObject(msg, "device_id", dev_id ? dev_id : "");
+        cJSON_AddStringToObject(msg, "device_name", dev_name ? dev_name : "");
+        cJSON_AddStringToObject(msg, "command", command);
+        cJSON_AddStringToObject(msg, "action", action_str);
+        cJSON_AddNumberToObject(msg, "value", value);
+        /* When it was queued (CLOCK_MONOTONIC ms): a plugin drops a repeat that waited too long */
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        cJSON_AddNumberToObject(msg, "ts", (double)((uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL));
+        if (config) {
+            /* A device with no "config" object goes as itself, but not its command list: the
+             * datagram outgrew the plugin's buffer and the fields after it were lost */
+            cJSON *cfg = cJSON_CreateObject();
+            const cJSON *it = NULL;
+            cJSON_ArrayForEach(it, config) {
+                if (it->string && strcmp(it->string, "commands") != 0) {
+                    cJSON_AddItemReferenceToObject(cfg, it->string, (cJSON *)it);
+                }
+            }
+            cJSON_AddItemToObject(msg, "config", cfg);
+        }
+    }
+
+    char *json = msg ? cJSON_PrintUnformatted(msg) : NULL;
+    ssize_t sent = -1;
+    if (json) {
+        /* Never waits: this runs under the lock of every device send, and a plugin busy with
+         * a slow device (its queue full) stalled IR and Bluetooth keys behind it */
+        sent = sendto(s, json, strlen(json), MSG_DONTWAIT, (struct sockaddr *)&sun, sizeof(sun));
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            printf("[!] Plugin '%s' busy (queue full): '%s' %s dropped\n", plugin_id, command, action_str);
+        }
+        free(json);
+    }
+    if (msg) cJSON_Delete(msg);
+    close(s);
+    return (sent > 0) ? 0 : -1;
 }

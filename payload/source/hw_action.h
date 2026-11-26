@@ -1,6 +1,7 @@
 #ifndef HARMONY_HW_ACTION_H
 #define HARMONY_HW_ACTION_H
 
+#include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
 #include "cJSON.h"
@@ -85,11 +86,36 @@ int hw_ir_send_harmony_keycode(const char *keycode, uint8_t ports, uint8_t repea
  * encodes protocol waveform, and sends directly via I2S, BTstack FIFO, or MQTT.
  */
 int hw_device_command_send_action(const char *target, int match_mode, const char *command, int action);
+/* As _send_action, with a numeric argument for plugin commands (the datagram's "value"). A
+ * plugin command with "range": [min, max] refuses a value outside it with HW_ERR_VALUE_RANGE,
+ * and the senders without a value (HW_VALUE_NONE: remote keys, activity steps, send_command
+ * without "value") with HW_ERR_VALUE_MISSING. Other command types ignore the value. */
+int hw_device_command_send_value(const char *target, int match_mode, const char *command, int action, int value);
+#define HW_VALUE_NONE INT_MIN
+/* outside the errno range: the infrared senders return -errno codes (-7 is -E2BIG) */
+#define HW_ERR_VALUE_RANGE (-1007)
+#define HW_ERR_VALUE_MISSING (-1008)
+/* an HTTP/TCP command not sent: the send queue of net_action.c is full */
+#define HW_ERR_QUEUE_FULL (-1009)
+/* 1 when value fits the command's "range" (or the command has none) */
+int hw_command_value_in_range(const cJSON *cmd, int value);
+/* 1 when the device's command (exact name, any case) is a plugin command with a range, so a
+ * send without a value would be refused. 0 while the command's infrared alternative is on: the
+ * infrared send takes no value */
+int hw_device_command_needs_value(const char *target, int match_mode, const char *command);
 int hw_device_command_send(const char *device_id, const char *command);
 int hw_device_command_send_by_id(const char *device_id, const char *command);
 int hw_device_command_send_by_name(const char *device_name, const char *command);
 int hw_device_exists(const char *target, int match_mode);
 int hw_device_command_exists(const char *target, int match_mode, const char *command);
+
+/* The Hub's name for plugins (settings hub_name), sent as "hub_name" in every plugin datagram: a
+ * plugin that registers the Hub on its device (a Samsung TV's list of allowed devices) shows it.
+ * HW_HUB_NAME_DEFAULT when none was set (or the old default "Harmony Hub", the stock Logitech
+ * name). Set by apply_hub_settings() at start and on every settings save. */
+#define HW_HUB_NAME_DEFAULT "Harmony-NG Hub"
+void hw_set_hub_name(const char *name);
+void hw_get_hub_name(char *out, size_t len);
 
 /*
  * In-process handler for commands of MQTT-type devices: hub_mqtt publishes the device's pulse
@@ -111,6 +137,11 @@ int hw_device_bt_host(const char *device_id, char *out, size_t outlen);
 /* Closes the Bluetooth link of a device's host (disconnect_host <addr> to hub_btstack), as the
  * stock firmware does after a Bluetooth device's power-off command. 0 when sent, -1 without a host. */
 int hw_device_bt_disconnect(const char *device_id);
+/*
+ * Plugin socket command dispatcher: sends formatted command JSON to /tmp/plugins/<plugin_id>.sock
+ */
+int hw_plugin_command_send(const char *plugin_id, const char *dev_id, const char *dev_name,
+                          const char *command, int action, int value, const cJSON *config);
 
 #ifdef __cplusplus
 }

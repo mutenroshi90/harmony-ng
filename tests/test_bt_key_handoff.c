@@ -21,6 +21,8 @@
 #include "../payload/source/hw_action.h"
 #include "../payload/source/orchestrator.h"
 #include "../payload/source/hub_events.h"
+#include "../payload/source/net_action.h"
+
 
 #define PIPE_PATH "/tmp/bthid_input"
 #define HOST_ADDR "00:11:22:33:44:55"
@@ -29,6 +31,8 @@
 orch_state_t orch_get_state(void) { return ORCH_STATE_RUNNING; }
 const char *orch_get_current_activity(void) { return "1"; }
 void hub_events_emit(hub_event_type_t type, cJSON *payload) { (void)type; cJSON_Delete(payload); }
+/* HTTP/TCP devices (net_action.c): none in these tests */
+int net_action_send(const cJSON *dev, const cJSON *cmd, const char *dev_id, const char *dev_name, const char *command, int live_key) { (void)dev; (void)cmd; (void)dev_id; (void)dev_name; (void)command; (void)live_key; return 0; }
 /* The device list: hw_action.c takes a copy today; with the shared-snapshot change it takes a
  * reference instead. Both forms are here so this test builds either way. */
 static cJSON *device_list_new(void) {
@@ -61,6 +65,17 @@ int ir_encode_raw(uint32_t freq_hz, const uint32_t *timings_us, size_t count, ui
 int ir_encode_harmony_keycode(const char *keycode, uint8_t repeats, uint8_t **out_bin, size_t *out_len) {
     (void)keycode; (void)repeats; (void)out_bin; (void)out_len;
     return -1;
+}
+/* the RC5 toggle bit of a press (ir_encoder.c): not looked at here */
+int ir_keycode_is_rc5_toggle(const char *keycode) { (void)keycode; return 0; }
+int ir_encode_harmony_keycode_toggle(const char *keycode, uint8_t repeats, int rc5_toggle, uint8_t **out_bin, size_t *out_len) {
+    (void)rc5_toggle;
+    return ir_encode_harmony_keycode(keycode, repeats, out_bin, out_len);
+}
+/* repeat parts of a press (ir_encoder.c): none here, a tap is one send */
+int ir_press_repeat_parts(const char *keycode, const uint8_t *blob, size_t blob_len, int press_min_repeats) {
+    (void)keycode; (void)blob; (void)blob_len; (void)press_min_repeats;
+    return 0;
 }
 int ir_i2s_blast_blob(const uint8_t *blob, size_t len, uint8_t port_mask) { (void)blob; (void)len; (void)port_mask; return 0; }
 /* The held-key IR player change adds these two to the transmitter; unused here */

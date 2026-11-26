@@ -59,6 +59,37 @@ int ir_parse_harmony_raw(const char *code, uint32_t *carrier_hz, int32_t *timing
 int ir_encode_harmony_keycode(const char *keycode, uint8_t min_repeats,
                              uint8_t **out_buf, size_t *out_len);
 
+/* 1 when keycode is a "G:<protocol>:..." code of an RC5 protocol with a toggle bit (its
+ * protocol name has "RC5" and "Toggle", as "Philips RC5 13 Bit Toggle") */
+int ir_keycode_is_rc5_toggle(const char *keycode);
+
+/* ir_encode_harmony_keycode() with the RC5 toggle bit of this press: rc5_toggle 1 sends an RC5
+ * "Toggle" code with its toggle bit (bit 11 of the 13 sent) flipped, 0 as stored. Other codes
+ * ignore it. A stock Hub keeps the bit per device and protocol and flips it after each press. */
+int ir_encode_harmony_keycode_toggle(const char *keycode, uint8_t min_repeats, int rc5_toggle,
+                                    uint8_t **out_buf, size_t *out_len);
+
+/* A device's "pressMinRepeats" when it has none: what a stock Hub uses for an account without
+ * the value. The field takes 0..IR_PRESS_MIN_REPEATS_MAX. */
+#define IR_PRESS_MIN_REPEATS_DEFAULT 3
+#define IR_PRESS_MIN_REPEATS_MAX     20
+
+/*
+ * How many repeat parts a press of keycode sends after its start part, as a stock Hub does
+ * (irmanager.lua generateFromKeyCode, hal ir_send_thread): N = press_min_repeats, the device's
+ * "pressMinRepeats" (negative: not set, IR_PRESS_MIN_REPEATS_DEFAULT; at most
+ * IR_PRESS_MIN_REPEATS_MAX). blob is the code as ir_encode_harmony_keycode() made it.
+ *  - a learned code (F<carrier>P...S...) or keycode NULL (timings given as they are): 0, the
+ *    code goes out once
+ *  - start and repeat are the same sequence (a keycode with an empty start group, most
+ *    protocols): max(N, floor) - 1, so a press sends the frame max(N, floor) times; floor is
+ *    3 for Sony (its receivers act only on a repeated frame), else 1
+ *  - a start and a separate repeat sequence (e.g. "Toshiba 32 Bit", the frame then the NEC
+ *    repeat code): N
+ * The command's own "repeats" and the keycode's trailing ":N" do not count, as on stock.
+ */
+int ir_press_repeat_parts(const char *keycode, const uint8_t *blob, size_t blob_len, int press_min_repeats);
+
 void ir_free_encoded(uint8_t *buf);
 
 #ifdef __cplusplus

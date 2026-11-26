@@ -180,7 +180,7 @@ export class HarmonyAppDevicesIrdb extends HarmonyAppDevicesStudio {
     if (!devId) return alert(t('select_device_first_dot', 'Select a device first.'));
 
     const targetDev = (this.inventory.devices || []).find(d => String(d.id) === String(devId));
-    const targetPort = targetDev ? ((targetDev.controlPort !== undefined) ? targetDev.controlPort : 7) : 7;
+    // No port: an imported command follows the device's Blaster Assignment
 
     const cmdPayloads = [];
     document.querySelectorAll('.irdb-cmd-cb:checked').forEach(cb => {
@@ -188,9 +188,9 @@ export class HarmonyAppDevicesIrdb extends HarmonyAppDevicesStudio {
       const raw = cb.getAttribute('data-raw');
       const key = cb.getAttribute('data-keycode');
       if (raw) {
-        cmdPayloads.push({ name, raw, repeats: 3, port: targetPort });
+        cmdPayloads.push({ name, raw, repeats: 3 });
       } else if (key) {
-        cmdPayloads.push({ name, raw: key, repeats: 3, port: targetPort });
+        cmdPayloads.push({ name, raw: key, repeats: 3 });
       }
     });
 
@@ -219,7 +219,12 @@ export class HarmonyAppDevicesIrdb extends HarmonyAppDevicesStudio {
         if (rawBox) rawBox.value = res.raw;
         if (necBox && res.nec) necBox.value = res.nec;
         if (keyBox && res.keycode) keyBox.value = res.keycode;
-        if (status) status.textContent = tf('irdb_captured_signal', { mode: res.mode || 'raw' });
+        /* a learned code keeps every frame of the press, and a tap sends them all */
+        if (status) {
+          status.textContent = res.frames
+            ? tf('irdb_captured_frames', { frames: res.frames, ms: Math.round((res.duration_us || 0) / 1000) })
+            : tf('irdb_captured_signal', { mode: res.mode || 'raw' });
+        }
       } else {
         if (status) status.textContent = t('irdb_no_signal');
       }

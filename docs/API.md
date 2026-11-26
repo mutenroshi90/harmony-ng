@@ -6,7 +6,7 @@
 
 **Requests from web pages.** Port 8089 refuses requests and WebSocket upgrades that a browser sends on behalf of another web site: an `Origin` header that is not the Hub's own clients answers `403`, and so does a request without `Origin` that the browser marks `Sec-Fetch-Site: cross-site` or `same-site`. A WebSocket upgrade refused this way gets no answer: the connection is closed. Allowed origins: the Hub itself (the `Origin` host matches the request's `Host`, or `X-Forwarded-Host` behind a reverse proxy), `http://` and `https://` with `localhost`, `127.0.0.1` or `[::1]` on any port (the Android app, local development servers), `capacitor://localhost` and `ionic://localhost`. Clients outside a browser (the Home Assistant integration, scripts, `curl`) send neither header and are not affected. A CORS preflight (`OPTIONS`) from any other origin is answered `403`. On port 8088 (Logitech protocol) only the WebSocket upgrade is checked: one with an `Origin` other than the request's own `Host` is answered `403`; its two HTTP routes (1.12) are not checked.
 
-**Request size.** A request body may be at most 64 KB, except `POST /api/rf-mapping-save`, `POST /api/remote-mapping-save` and `POST /api/ui-remote-layout` (a whole button map or the web remote layouts, up to 256 KB), and `POST /import` and `POST /api/custom-icons` (up to 2 MB; the icon image itself may be at most 16 KB, see 1.8). A larger `Content-Length` is answered `413` before the body is read.
+**Request size.** A request body may be at most 64 KB, except `POST /api/rf-mapping-save`, `POST /api/remote-mapping-save` and `POST /api/ui-remote-layout` (a whole button map or the web remote layouts, up to 256 KB), and `POST /import`, `POST /api/custom-icons` and `POST /api/plugins/install` (up to 2 MB; the icon image itself may be at most 16 KB, see 1.8). A larger `Content-Length` is answered `413` before the body is read.
 
 **Request bodies.** Most `POST` routes take a JSON object, or a form-encoded body (`a=1&b=2`; every value is then a string). JSON only: activity start, power off, Help and its answer, `activity-progress`, `pronto-blast`, `ir-raw`, `ir-capture`, `button-press` and `custom-icons`.
 
@@ -79,7 +79,7 @@ Returns high-level hub status, firmware, identity, active activity, flash space,
   - `auth_enabled`: whether authentication is on. `role` (`"admin"` or `"user"`) and `user` are the
     caller's own: the account name, `pat:<token name>` for a personal access token, `"admin"` when
     authentication is off or the request comes from the Hub itself.
-  - `has_icons`: the stock icon set is unpacked and can be served.
+  - `has_icons`: the stock icon set can be served (read from the packed archive, or unpacked into `/tmp`).
   - `mqtt.broker` is `""` while MQTT is disabled.
   - `hub_id`: the factory unit id from the `mfg` partition (unique per unit, survives reflashes); the
     identifier for device registries and unique ids. Falls back to the Wi-Fi MAC (12 lowercase hex
@@ -142,7 +142,10 @@ Returns the flash space of `/data` (of root `/` when `/data` cannot be read) and
     "cache_total_kb": 8192,
     "cache_free_kb": 2048,
     "cache_used_kb": 6144,
-    "cache_percent_free": 25
+    "cache_percent_free": 25,
+    "stock_resources_kb": 251,
+    "stock_resources_saved": true,
+    "can_empty_stock_resources": true
   }
   ```
 
@@ -373,11 +376,27 @@ Answers of the actions below:
   or the services restart after it (`updating` of `GET /api/update-status`, 2.1).
 - `factory_reset`: `{"ok": true, "message": "Factory reset initiated. Reverting to stock firmware and rebooting."}`;
   `400` without `"confirm": "RESET"`.
+- `clean_stock_resources`: empties `/data/resources`, the stock Logitech files. Needs
+  `"confirm": "EMPTY"` (`400` without). `409` while `/data/harmony/config/devices.json` is missing or empty
+  (the stock import still needs the files), when `/data/resources` is a link, and while no saved copy of
+  the files as they are exists: `/data/harmony/stock_resources_saved` holds `<copy name> <count>:<hex>`,
+  written by `tools/backup_hub.py` once `backups/stock_resources_<hub>*.tar` holds exactly the files (every
+  `deploy_hub.py` run makes that backup). `<hex>` is the XOR of sha256(`"<size> <path>"`) over every
+  entry under `/data/resources` but directories (path relative to it, a link counts as size 0); the
+  route computes it again and refuses when it differs. `500` when a file could
+  not be removed or the directory not read. Answers
+  `{"ok": true, "freed_kb": 48, "stock_resources_kb": 0, "message": "..."}`: `freed_kb` is the free space
+  of `/data` gained. In `GET /api/disk-space`, `stock_resources_kb` is the files' own size; `/data` is
+  JFFS2, which compresses, so the flash space they take (and `freed_kb`) is smaller.
+  `stock_resources_saved` says whether the mark matches the files there now (false when there are
+  none), `can_empty_stock_resources` whether the action would run. The stock firmware needs these
+  files: `tools/restore_stock.py` puts the saved copy back on a stock restore whose archive holds none,
+  and refuses without it.
 - `mqtt_publish`: only `topic` and `payload` are read. `retain` is ignored: the message goes out
   with QoS 0 and is not retained. An empty `payload` is sent as `cmd`. The answer is
   `{"ok": true}` also when MQTT is off or `topic` is empty, so it does not tell whether anything
   was published.
-- A fourth action, `auth`, turns authentication on or off and sets the admin account (11.6).
+- A fifth action, `auth`, turns authentication on or off and sets the admin account (11.6).
 - An unknown or missing `action` answers `200` `{"ok": true}` and does nothing.
 
 #### `POST /api/system-action` or `POST /system`
@@ -572,7 +591,7 @@ Executes `/data/harmony/update.sh` in the background and restarts services.
   `update-check`. `repo` chooses the server the new firmware is downloaded from, so like every
   route that changes the Hub this one is for admins once authentication is on (11.5). With
   authentication off (the default after install) any client on the LAN may call it.
-- **Signed releases only**: the update source (the official `ota` branch, or `repo`) must publish `manifest.json` and `manifest.json.sig`, the Ed25519 signature of the manifest by a release key built into the Hub firmware (`payload/source/ota_keys.h`). `update.sh` checks the signature with `hub_util ota-verify`, takes the version from the signed manifest, and installs a file only when its SHA-256 matches the manifest. Without a valid signature nothing is changed, whatever server `repo` names. TLS is not relied on: the Hub's `wget` does not verify certificates.
+- **Signed releases only**: the update source (the official `ota` branch, or `repo`) must publish `manifest.json` and `manifest.json.sig`, the Ed25519 signature of the manifest by a release key built into the Hub firmware (`payload/source/ota_keys.h`). `update.sh` checks the signature with `hub_util ota-verify`, takes the version from the signed manifest, and installs a file only when its SHA-256 matches the manifest. Without a valid signature nothing is changed, whatever server `repo` names. Downloads use `hub_fetch`, which checks the server certificate against the CA bundle (`/data/harmony/cacert.pem`); a Hub without `hub_fetch` (the first update from an older release) or without the bundle falls back to BusyBox `wget`, which checks no certificate. The signature check does not depend on TLS either way. When the certificate check fails, a file the signature covers (the manifest, its signature, the package and the files checked against the manifest) is fetched again without it and without the token of a private source, and the signature decides; the version check (`VERSION` files, the GitHub release list) is not fetched that way, since nothing signs it, and fails instead.
 - **Services restart, no reboot**: once every file is installed, `update.sh` restarts the Hub services with `init.sh restart`, as `build/deploy_hub.py` does by default. An update has no kernel modules. Waiting for the next boot: a new `rcS.local`, the running SSH server (it keeps its old binary) and the USB port mode chosen at boot. `update.sh` removes what a reboot used to clear and the new daemon would reuse: the icons extracted from the old `icons.tar.gz` (`/tmp/www/assets/icons`) and a remote image kept for a resume (`/tmp/remote_ui.ota.gz`, `/tmp/remote_manifest.json*`). Without an executable `init.sh` it reboots the Hub (`safe_reboot.sh`) instead.
 - **Not during an activity switch**: the update ends with a services restart, which must not cut an activity switch in the middle. While a switch runs, a request is queued behind it, or the steps after the switch point are still being sent, the request is refused with **`409 Conflict`** and starts nothing:
   ```json
@@ -628,7 +647,10 @@ Returns all registered devices and basic commands from `/data/harmony/config/dev
   The object is `devices.json` as the Hub stores it. Every device has the fields above, and `icon`
   when one was set. By kind of device:
   - infrared (every `type` that is not Bluetooth or MQTT): `controlPort` (the IR port mask, 0 to 7),
-    and `port` and `repeats` in each command;
+    `pressMinRepeats` when set (3.2), and `repeats` in each command. A command has `port` (1 to 7) only when it has its own Emitter
+    Port, which a send uses instead of `controlPort`. `"commandPorts": 1` at the top marks a file
+    whose command ports were set that way: in a file without it, every command's `port` is a copy
+    of its device's port that no send used, and the Hub drops those once at load;
   - Bluetooth (`type` `BT`, `BTHID` or a type that contains `Bluetooth`): no `controlPort`,
     commands without `port` and `repeats`; instead `bdaddr`, `btAutoReconnect`,
     `btReconnectDurationSec`, `btReconnectDelaySec`, and `btTriggerDeviceId` and
@@ -636,19 +658,29 @@ Returns all registered devices and basic commands from `/data/harmony/config/dev
     (`POST /api/bt-link-device`, 6.5) has `bdaddr` too;
   - MQTT (`type` `MQTT`, or `mqttEnabled` true, see 8.1 "MQTT-type devices"): no `controlPort`,
     commands without `port` and `repeats`; instead `"mqttEnabled": true`, `mqttTopic` and
-    `mqttPulseMs`. A device never has `controlPort` and `mqttEnabled` together.
+    `mqttPulseMs`. A device never has `controlPort` and `mqttEnabled` together;
+  - HTTP and TCP (`type` exactly `HTTP` or `TCP`, see 3.9): no `controlPort`, commands without
+    `port` and `repeats`; instead `netHost`, `netPort`, `netTls`, `netTlsVerify`, `netTimeoutMs`,
+    and for HTTP `httpHeaders`, `httpAuthType`, `httpUser`. `httpPassword` and `httpToken` are
+    always sent as `""`, with `"hasHttpPassword": true` / `"hasHttpToken": true` when one is
+    stored. Commands carry `keyCode` `HTTP:<name>` with `httpMethod`, `httpPath`, `httpBody`,
+    `httpContentType`, or `TCP:<name>` with `tcpPayload` and `tcpFormat`.
 
   A command carries its code as `keyCode` and as `raw`, and `"isMacro": true` when it is a macro.
 - **Response `404`**: `{"ok": false, "error": "DeviceList not found"}` when the list cannot be loaded.
 
 #### `GET /api/devices`
-Returns `devices.json` as stored (`{"devices": [...]}`), `404` when it cannot be read.
+Returns `devices.json` as stored (`{"devices": [...]}`), `404` when it cannot be read. The
+credentials of HTTP devices are hidden as in `GET /api/inventory`.
 
 ### 3.2 Save Device
 #### `POST /api/device-save` or `POST /ir/device`
 Creates or updates a device definition. A field that is left out keeps its stored value; a field
 with another name than those below is ignored without an error. Also read: `icon`, `powerOnDelay`,
-`isPowerAlwaysOn`, `powerOnSequence`, `powerOffSequence`, and for a Bluetooth device `bdaddr`
+`isPowerAlwaysOn`, `hideOnRemote` (true leaves the device out of the Elite's device pages and
+activity cards at the next config push; its commands still work from activity screen buttons
+and keys), `hideInDevicesTab` (true leaves the device out of the Devices tab of both web UIs;
+the remote and the device editor still list it), `powerOnSequence`, `powerOffSequence`, and for a Bluetooth device `bdaddr`
 (older name `btHost`), `btAutoReconnect` (default on), `btReconnectDurationSec`,
 `btReconnectDelaySec`, `btTriggerDeviceId` and `btTriggerCommandName`. The MQTT pulse length is
 `mqttPulseMs` (milliseconds, default 1000); only `POST /api/device-mqtt-test` also takes `mqttPulse`.
@@ -664,6 +696,41 @@ gets `"Generic"`, and without `name` is named after its id. `powerOnDelay` is 0 
 `controlPort`, its commands are stored without `port` and `repeats`, and they go out as MQTT pulses
 on `mqttTopic` (default `{base_topic}/button/{device}/{command}`). Leave the MQTT fields out for an
 infrared or Bluetooth device.
+
+`"plugin": "<id>"` (or `type` `plugin:<id>`) makes the device a plugin device (docs/PLUGINS.md): no
+`controlPort`, its commands go to the plugin, and `config` (an object, or that object as a JSON
+string) holds the values of the plugin's `config_fields`. The id must be a safe plugin id (letters,
+digits, `-`, `_`), or the save is refused with `400`. A device's `type` text never makes it a
+plugin device, even when it matches a plugin's name. A top-level key is copied into `config` only
+for a plugin device and only when the plugin's `config_fields` declare it. The plugin choice comes
+before the MQTT and Bluetooth guesses from `type` and `manufacturer`. A save without `plugin` keeps
+the stored one; `"plugin": ""` makes the device a non-plugin device again. A command of a plugin
+device may carry `irKeyCode` (an infrared code, as an IR device's `keyCode`) and `irWhen` (the key of
+a boolean `config` field, letters, digits, `_` or `-`, at most 63): while `config[irWhen]` is on
+(`true`, a number other than 0, `"true"` or `"1"`) the command is sent as infrared, as a command of
+an IR device (its `port` 1 to 7, else all blasters; `repeats`, 3 when missing), instead of going to
+the plugin (docs/PLUGINS.md). An invalid `irKeyCode` or `irWhen` is left out. In a `commands` list,
+each of the two keys a command leaves out keeps the value the device's command of that name had
+(so a save that changes only `irKeyCode` keeps `irWhen`), `null` or `""` removes it, and a command the device did not have gets those of the plugin manifest's
+`default_commands` entry of the same name. A command with an `irKeyCode` keeps `port` and
+`repeats`; other plugin commands store neither.
+
+`type` `HTTP` or `TCP` makes the device an HTTP or TCP device (3.9). Its fields: `netHost` (host
+name or IP address: letters, digits, `.`, `-`, `_`, `:`), `netPort` (1 to 65535; an HTTP device
+without one uses 80, or 443 with TLS), `netTls` (bool), `netTlsVerify` (`verify`, the default,
+`pin` or `insecure`), `netTimeoutMs` (500 to 15000, default 3000), and for HTTP `httpHeaders`
+(at most 8 `{"name", "value"}`; not `Host`, `Connection`, `Content-Length`,
+`Transfer-Encoding`), `httpAuthType` (`none`, `basic` or `bearer`), `httpUser`, `httpPassword`,
+`httpToken`. An empty or missing `httpPassword` / `httpToken` keeps the stored one, but only while
+`netHost`, `netPort` and `netTls` stay the same: a save that changes one of them drops the stored
+secret (send it again). Only the credentials of the chosen `httpAuthType` are kept. Header values
+and `httpPath` (with its query) are not secret: `GET` returns them as stored, so put a key in
+`httpToken` or `httpPassword`, not in a header or the path. `netHost` cannot be the Hub itself
+(`localhost`, `127.x`, `::1`) or start with `-`. With `netTlsVerify` `verify` the device must
+speak TLS 1.2; `pin` and `insecure` also accept TLS 1.0 and 1.1. A host, port, timeout, verify mode, auth type
+or header that cannot be used (a header name with a space, a value with CR or LF) is refused with
+`400`. The HTTP/TCP choice comes before the MQTT and Bluetooth guesses (only a plugin wins over
+it). The command fields are saved with `POST /api/command-save` (3.5) or a `commands` list.
 - **Request Body**:
   ```json
   {
@@ -685,9 +752,15 @@ infrared or Bluetooth device.
   changed; a larger value already in `devices.json` is lowered to 10000 when the file is loaded.
   The three waits are for commands a program sends (API, MQTT, activity sequences); a key pressed
   on a remote is sent without them.
+- `pressMinRepeats` (infrared devices): how many frames a press sends after the first, as the
+  Logitech account's `PressMinRepeats` (5.1, "Frames of a press"). 0 to 20 (a number or numeric
+  text; a larger value is lowered to 20). `null`, `""` or a negative number removes it, and the
+  Hub then uses 3, as a stock Hub does for an account without the value; left out, the stored
+  value is kept. A device without it in `devices.json` gets none when the file is loaded (no
+  default is written); a value that is not a count is dropped there.
 - **Response `200 OK`**: `{"ok": true, "deviceId": "70321456", "id": "70321456"}` (both carry the device's id, the new one for a device the Hub just created)
 - **Response `400`**: `{"ok": false}` when a timing field (the three delays, `powerOnDelay`, `btReconnectDurationSec`, `btReconnectDelaySec`) is not a number (or numeric string) or a
-  delay is out of range.
+  delay is out of range, or `pressMinRepeats` is text that is not a number.
 - **Response `500`**: `{"ok": false, "error": "..."}` when `devices.json` could not be written (flash
   full); the stored devices are kept.
 
@@ -695,8 +768,8 @@ infrared or Bluetooth device.
 #### `POST /api/device-delete` or `POST /ir/delete-device`
 Deletes a device that nothing uses any more. References are not removed: while an activity (its
 `startSequence`, `stopSequence`, `deviceIds` or any other step), another device's
-`btTriggerDeviceId`, or a key binding of a remote map (`remote_slot1_map.json`,
-`remote_slot2_map.json`, `bt_remote_map.json`) names the device, the delete is refused and nothing
+`btTriggerDeviceId`, or a key binding of a remote map (`remote_slot1_map.json` to
+`remote_slot6_map.json`, `bt_remote_map.json`) names the device, the delete is refused and nothing
 changes. Not counted, so a device never becomes impossible to delete: the map's own page for the
 device (`devices/<id>`, removed from the maps together with the device, so a new device given the
 same id starts without it), map sections of activities and pages of devices that no longer exist,
@@ -779,9 +852,20 @@ Adds or updates a single command for a device.
   - `oldName`: the present name of a command to rename (to `name`).
   - `script`: a Bluetooth macro; it is stored as `BT:SCRIPT:<script>` with `"isMacro": true` and
     replaces `raw`.
-  - `repeats` defaults to 3; `port` is stored only when above 0 (else the device's `controlPort`
-    applies). For a Bluetooth or MQTT device, and for a Bluetooth (`HID:`, `G:HID`) or MQTT
-    (`G:MQTT`) code, `port` and `repeats` are not stored.
+  - `repeats` (1 to 20, higher is 20) and `port` are numbers or, from a form post, numeric text.
+    `repeats` left out keeps the stored value (3 for a new command). It is stored and kept for
+    clients, but it does not set how many frames a press sends: the device's `pressMinRepeats`
+    does (3.2, 5.1), as on a stock Hub, where the trailing `:3` of a keycode is not read either.
+  - `port`: the command's own IR port mask, 1 to 7, used by a send instead of the device's
+    `controlPort`, also when that is `0` (No Blasters). `0` (Default (Device Setting)) removes it, so the device's port applies; left
+    out, the stored one is kept. For a Bluetooth or MQTT device, and for a Bluetooth (`HID:`,
+    `G:HID`) or MQTT (`G:MQTT`) code, `port` and `repeats` are not stored. 3.6 treats both fields
+    the same way.
+  - `irKeyCode` and `irWhen` (plugin devices only, 3.4): the infrared alternative of the command.
+    A string sets one (an invalid one is left out), `null` or `""` removes it, left out the stored
+    one is kept; a new command without them gets those of the plugin manifest's `default_commands`
+    entry of the same name. A plugin command with an `irKeyCode` stores `port` and `repeats` like
+    an IR command; other plugin commands store neither. 3.6 treats both fields the same way.
 - **Response `200 OK`**: `{"ok": true}`; `{"ok": false}` (also `200`) when the device does not
   exist or `deviceId` or `name` is missing.
 - **Response `500`**: `{"ok": false, "error": "..."}` when `devices.json` could not be written (flash
@@ -835,13 +919,70 @@ Publishes the MQTT pulse of a device once, the way a command to an MQTT-type dev
 - **Response `200 OK`**: `{"ok": true, "pulseMs": 1000, "topic": "harmony/hub/button/Plug/PowerToggle", "message": "MQTT test publish sent"}`.
 - **Response `503`**: `{"ok": false, "error": "MQTT broker not connected"}`: MQTT is disabled or the broker is not connected.
 
+### 3.9 HTTP and TCP Devices
+A command to an HTTP device is one request to `netHost:netPort` (HTTPS with `netTls`); a command
+to a TCP device opens a connection, sends `tcpPayload` and closes it. Both run on one worker
+thread in the order they come: the key path never waits for the device. A press and each repeat
+of a held key send the command; a release sends nothing. In `httpPath` (percent-encoded),
+`httpBody` and `tcpPayload`, `{device}` and `{command}` are replaced with the device and command
+name. `tcpFormat` `text` decodes `\r`, `\n`, `\t`, `\\` and `\xHH`; `hex` sends the hex digits as
+bytes (spaces and `:` between them are ignored). An HTTP request has `Connection: close`, the
+device's headers, `Authorization: Basic ...` or `Bearer ...`, and a `Content-Type`
+(`httpContentType`, else `application/json` for a body starting with `{` or `[`, else
+`text/plain`). Redirects are not followed.
+
+TLS (BearSSL, TLS 1.0 to 1.2) checks the certificate by `netTlsVerify`:
+- `verify`: it must chain to a CA in `/data/harmony/cacert.pem` and name `netHost` (a certificate
+  for an IP address is not supported: use `pin` for one);
+- `pin`: the first key the device shows is kept in `config/tls_pins.json` (by `host:port`), and
+  a connection with another key is refused until the pin is forgotten (below);
+- `insecure`: any certificate (encryption only).
+
+A clock that is not set yet (before the build date) is taken as the build date for the
+certificate dates.
+
+#### `POST /api/device-net-test`
+Runs a command of an HTTP or TCP device now and waits for it (up to about 4 times
+`netTimeoutMs`). Without `command`: the connection and TLS handshake only.
+- **Request Body**: `{"id": "50", "command": "Power"}` (`deviceId` is accepted as well).
+- **Response `200 OK`**: `{"ok": true, "status": 200, "response": "{\"done\":true}", "tlsFingerprint": "9f86...", "pinned": true}`.
+  `ok` is false with an `error` when the request failed or answered 400 or more. `response` is
+  the start of the answer (512 bytes at most; for TCP the first data the device sent back).
+  `tlsFingerprint` is the SHA-256 of the server's raw public key (the key bytes of the
+  certificate, not the SubjectPublicKeyInfo, so not what `openssl x509 -pubkey` hashes to);
+  `pinned` is set when this run pinned it. A command from a remote key is sent once per press (a
+  held key sends no repeats), and one still queued after 2 s, or for a device that timed out in
+  the last 10 s, is dropped (`dropped:` in the log). Only a live key is dropped: a person's press
+  that arrives late is wrong, while a command of an automation must arrive. Live keys are the
+  hard keys, the screen buttons and the device pages of a touchscreen remote (hub_rf), the keys
+  of a Bluetooth remote, the remote views of both web UIs, and any `ir-send` or `send_command`
+  with `"live": true` (5.1, 10.3). Activity steps and every other `ir-send`, MQTT and WebSocket
+  send (Home Assistant, scripts, the Logitech protocol) wait in the queue and go out in order. A
+  send answers `ok` when it is queued, also one that is dropped later; a lone `hold` or `repeat`
+  answers `ok` and sends nothing. The queue holds 16 sends. When it is full, a send is refused:
+  `ir-send` answers `503` `"send queue full"`, an activity step is lost and logged once (`[!] Orch:
+  activity '<id>' step '<step>' lost`), and a live key takes the place of the oldest live key
+  that is over 1 s old (late for a key pressed now). The host is resolved once per send; a host
+  with any address on the Hub itself (loopback) is refused, and the connection goes to the
+  addresses that were checked.
+- **Response `400`**: not an HTTP or TCP device. **`404`**: no device with that id, or no
+  command of that name.
+
+#### `POST /api/device-net-pin-forget`
+- **Request Body**: `{"id": "50"}`.
+- **Response `200 OK`**: `{"ok": true, "removed": true}` (`removed` false when no key was
+  pinned for the device's host and port).
+
 ---
 
 ## 4. Activities & Orchestration
 
 ### 4.1 List Activities
 #### `GET /api/activities`
-Returns all configured activities, active activity ID, and state enum.
+Returns all configured activities, active activity ID, and state enum. The list is in Display
+Order (`order`, lowest first; equal orders keep their place). The Hub keeps `activities.json` in
+that order (written back once at load when it was not), so the remotes and MQTT list the
+activities the same way; an activity without `order` gets one after the highest (99 at most).
 - **Response `200 OK`**:
   ```json
   {
@@ -980,7 +1121,8 @@ Saves activity configuration with start and stop sequence steps.
     the lowest free number from 1 to 99 as id. The answer does not carry the new id: read
     `GET /api/activities` again.
   - Defaults of a new activity: `name` `"Custom Activity"`, `type` `"Custom"`, `icon` `"Default"`,
-    `order` 1.
+    `order` after the highest one (99 at most), so it is listed last.
+  - `order` left out (or empty) keeps the stored Display Order of an existing activity.
   - `deviceIds` (also `devices`): the devices of the activity, as a list or as text separated by
     commas. When left out, the list is built from the devices named in the two sequences.
   - Steps are stored in one form, each with `type`, `command` and `deviceId`. Types: `Command` (a
@@ -1079,7 +1221,8 @@ Answers the question for one device of the last Help. `"on": false` sends that d
 #### `POST /api/ir-send` or `POST /ir/send`
 Transmits an IR command either by device ID and one command name, or raw Pronto hex. `command`
 (also accepted as `name`) must be one string: a list answers `400`. The reply also carries
-`deviceId` and `command`; a failed send answers `500` with `"error": "IR transmit failed"`.
+`deviceId` and `command`; a failed send answers `500` with `"error": "IR transmit failed"`, and a
+command of an HTTP or TCP device that finds their send queue full `503` `"send queue full"`.
 - **Request by Device Command**:
   ```json
   {
@@ -1087,6 +1230,18 @@ Transmits an IR command either by device ID and one command name, or raw Pronto 
     "command": "PowerToggle"
   }
   ```
+- **Value (plugin commands)**: `"value": 42` (an integer, or a string holding one; `1.9`,
+  `"abc"` or `true` answers `400` "value must be an integer") reaches the plugin as the
+  datagram's `value`. A plugin command with `"range": [min, max]` refuses a value outside it with
+  `400` and `"error": "value out of range"`, and needs one: without `value` it answers `400`
+  "value required". Senders that have no value (remote keys, activity steps) cannot use such a
+  command; the WebSocket and MQTT `send_command` take `"value"` for a single command. Other
+  command types ignore the value and their `range`. `POST /api/command-save` and
+  `/api/commands-batch` take `"range": [min, max]`, remove it with `null` or `[]`, and answer
+  `400` for any other range. In `POST /api/device-save`, a command without a `range` key keeps
+  the range the device's command of that name had, `null` or `[]` removes it (a removed range
+  stays removed), and a command the device did not have gets the one of the plugin manifest's
+  `default_commands` entry of the same name.
 - **Lists, repeats, delays and holds are not taken by this route.** `num_repeats`, `delay_secs`
   and `hold_secs` are ignored here. They work with the `send_command` action of the WebSocket
   (10.3) and MQTT (8.1), which takes this form:
@@ -1111,11 +1266,29 @@ Transmits an IR command either by device ID and one command name, or raw Pronto 
   is still down. With no `hold` and no `release` for 600 ms the Hub stops repeating by itself
   (a lost release cannot leave a key repeating), so a client that holds a key longer sends a
   `hold` at least every 300 ms, as the remote does. The repeating always ends after a whole
-  frame, and the start of the code always goes out, also when the release comes sooner. A `tap`,
-  each command of a list and each step of an activity is one send, as before. Another infrared
-  command ends a held key (it waits for the frame on air). A `hold` or `release` for a key that
+  frame, and the start of the code and the repeat parts of a press (below) always go out, also
+  when the release comes sooner or the holds stop. A `tap`, each command of a list and each step
+  of an activity is one press (below). Another infrared command ends a held key (it waits for the
+  frames that must still go out). A `hold` or `release` for a key that
   is not held does nothing. For a Bluetooth command `press` is key down, `release` key up and
   `hold` nothing. The `hold_secs` of `send_command` (10.3, MQTT) sends the holds itself.
+- **Frames of a press**: a press of a device's infrared command (a `tap`, a step, a command of a
+  list, and the start of a held key) sends the code's start part, then N repeat parts, as a
+  stock Hub does (its `irmanager.lua` and `hal`). N is the device's `pressMinRepeats` (3.2), 3
+  when the device has none. The command's `repeats` and the keycode's trailing `:3` do not count.
+
+  | Code | Frames of a press | N = 0 | N = 1 | N = 3 |
+  |---|---|---|---|---|
+  | empty start group, `G:<protocol>:()(code)():3` (most protocols; also Pronto with a repeat sequence only) | the frame max(N, 1) times | 1 | 1 | 3 |
+  | start group, `G:Toshiba 32 Bit:(code)(Repeat)():3` (also Pronto with a once and a repeat sequence) | the frame, then N repeat parts (for NEC types the short repeat code) | frame | frame + 1 | frame + 3 |
+  | Sony (`G:Sony <n> Bit:...`) | the frame max(N, 3) times: Sony receivers act only on a repeated frame | 3 | 3 | 3 |
+  | learned code (`F<carrier>P...S...`) | once, whatever N (it holds every frame of the learned press, 5.2a) | 1 | 1 | 1 |
+
+  A held key sends at least these frames and then repeats until the release. The routes that
+  send a code as given send it once: a code in `pronto`, `code` or `raw` of this route (below;
+  also a `G:` keycode), `POST /api/pronto-blast` (5.2), `POST /api/ir-test-learned` (5.2a),
+  `POST /api/ir-raw` (5.4), and an activity step that names a raw or Pronto code instead of a
+  command.
 - **Request by Raw Pronto**:
   ```json
   {
@@ -1128,6 +1301,11 @@ Transmits an IR command either by device ID and one command name, or raw Pronto 
   - `repeats`: Repeat count (default: 1).
   - `code` or `raw` is accepted for `pronto`. A Harmony code (`G:<protocol>:...`, or the raw timing
     form `F<carrier>P...S...` of 5.2a) given here is sent as that keycode.
+- **`live`** (optional, default `false`): `true` marks a person's press (a remote view, a
+  Bluetooth remote). It is sent like a key from a remote: without the gaps between commands
+  (`interKeyDelay`, `interDeviceDelay`), and for an HTTP or TCP device it is dropped when it
+  waited too long in the send queue, and may take the place of a live key over 1 s old when the
+  queue is full (3.9). Leave it out for automations: their commands wait their turn and go out.
 - **Other names**: `device_id`, `device` or `id` for `deviceId`; for `action`, `down` = `press`,
   `repeat` = `hold`, `up` = `release`.
 - **Duplicate filter**: a second `tap` or `press` of the same command of the same device that
@@ -1139,6 +1317,8 @@ Transmits an IR command either by device ID and one command name, or raw Pronto 
 - **Error `500`**: `{"ok": false, "deviceId": "70321456", "command": "PowerToggle", "error": "IR transmit failed"}`
   when the send failed: an unknown device or command, a code the encoder does not understand, or
   a transmit error (the text is the same for a Bluetooth or MQTT device).
+- **Error `503`**: `{"ok": false, "deviceId": "50", "command": "Power", "error": "send queue full"}`
+  when the command of an HTTP or TCP device finds their send queue (16 sends) full (3.9).
 
 ### 5.2 Raw Pronto Blast
 #### `POST /api/pronto-blast`
@@ -1159,14 +1339,17 @@ Dedicated blaster endpoint for raw Pronto hex code streams.
 
 ### 5.2a IR Learning (capture)
 #### `POST /api/capture`
-Listens on the Hub's IR receiver until a signal arrives or the timeout ends, then returns one frame as a Harmony raw timing string (`F<carrier hex>P<pulse us hex>S<space us hex>...`, the carrier measured, the last space the gap to the next frame). The string can be stored as a command's `raw` (`POST /ir/command`) and sent like any other keycode. The sensor is short-range: hold the original remote about 8 cm from the Hub and hold the button for 1 to 2 seconds (the first frame of a press is often cut, so the decoder keeps the first complete frame after it).
+Listens on the Hub's IR receiver until a signal arrives or the timeout ends, then returns the whole press as a Harmony raw timing string (`F<carrier hex>P<pulse us hex>S<space us hex>...`, the carrier measured, each space between frames as measured, the last space the gap to the next frame). As the stock Hub's capture does, it records until 200 ms without light, at most 1023 mark/space pairs (2 s at most), and keeps every frame of the press; the string can be stored as a command's `raw` (`POST /ir/command`), and a tap of that command sends it once, so every frame goes out again (3.5). Learn with one short tap: a key held for a second becomes a code a second long. The sensor is short-range and often misses the start of a press: hold the original remote 5 to 8 cm from the Hub. A first frame shorter than the next one is dropped (the sensor cut it), and so is a last frame without quiet after it (cut by the limit).
 - **Request Body** (optional): `{"timeout": 10}` in seconds, 1 to 30 (default 10). `?timeout=` works too, but is read only when the request has no body.
 - **Response `200 OK`**:
   ```json
-  {"ok": true, "raw": "F9470P...S...", "keycode": "F9470P...S...", "mode": "raw", "carrier_hz": 38000, "pulses": 26, "duration_us": 24000}
+  {"ok": true, "raw": "F9470P...S...", "keycode": "F9470P...S...", "mode": "raw", "carrier_hz": 38000, "pulses": 26, "duration_us": 24000, "frames": 1}
   ```
-  `pulses` is the number of timing intervals in `raw`, marks and spaces together (`P` and `S` entries); `duration_us` is their sum.
-- **Errors**: `408` no signal before the timeout, or only a flash that is not a code, `409` another capture is running, an IR send holds the hardware, or the capture mode (5.5) is on, `503` no IR receiver, or the receiver stopped delivering data (the capture gives up after 2 s without data instead of hanging; a reboot clears a stuck receiver), `500` other failures.
+  `pulses` is the number of timing intervals in `raw`, marks and spaces together (`P` and `S` entries); `duration_us` is their sum; `frames` the number of frames (a space of 20 ms or more ends one).
+- **Learning while the capture mode (5.5) is on**: works. The receiver thread that serves the mode records the learned press for this request, and no `ir_received` event is sent for that press; the mode stays reported on (`ir_capture` true, no `ir_capture` event). A press that was already going on when the request came is not learned: the thread first waits until the line is quiet. With the mode off, the thread is started for the learn and stopped after it.
+- **Hub IR sends during a learn** (activity steps, remote keys, `ir-send`, `ir-raw`) go out at once; they do not wait for the learn. The receiver sees the Hub's own blasters, so what it reads during a send and 100 ms after it is dropped, and a press that overlaps a send is not kept: the learn goes on waiting for the next press until its timeout. If that happened and nothing else was pressed, the `408` message says so.
+- **One learn at a time**: a second request while one waits is refused with `409`.
+- **Errors**: `408` no signal before the timeout, or only a flash that is not a code, `409` another capture is running, `503` no IR receiver, or the receiver stopped delivering data (the capture gives up after 2 s without data instead of hanging; a reboot clears a stuck receiver), or the Hub is shutting down, `500` other failures.
 
 #### `POST /api/ir-test-learned`
 Sends a captured code once through the IR ports of a device (its `controlPort`, default all).
@@ -1242,22 +1425,27 @@ Home Assistant's `infrared` platform produces). Capability flag: `ir_raw`.
 #### `POST /api/ir-capture`
 Turns the capture mode on or off. While it is on, a thread keeps the Hub's IR receiver open and
 pushes one `ir_received` event (10.13b) per button press, to every WebSocket client and on MQTT
-`<base>/ir/received` (8.1). It is what Home Assistant's infrared receiver uses to learn codes.
+`<base>/ir/received` (8.1). It is what Home Assistant's infrared receiver uses to learn codes. An
+event carries one frame of the press (the first complete one), not the whole press that
+`POST /api/capture` (5.2a) keeps.
 Capability flag: `ir_capture`. Admin only, like `POST /api/capture`.
 - **Request Body**: `{"enabled": true}` or `{"enabled": false}`.
 - **Response `200 OK`**: `{"ok": true, "ir_capture": true}`.
 - **Error `400`**: `enabled` missing or not a boolean.
-- **Error `409`**: a one-shot capture (`POST /api/capture`, 5.2a) is running.
 - **Error `503`**: no IR receiver, or it could not be set up.
 
 Behaviour:
-- One event per press: the first complete frame is decoded (as in 5.2a), then nothing until the
+- One event per press: the first complete frame is decoded (5.2a keeps every frame), then nothing until the
   receiver has been dark for 150 ms, so a held button gives one event.
 - Sends keep working while the mode is on (activity steps, `ir-send`, `ir-raw`): the receiver sees
   the Hub's own blasters, so what it reads during a send and 100 ms after it is dropped, and a
   press in that window is lost. A send also reprograms the shared I2S clock; the receiver sets
   its own clock again before it reads on.
-- While the mode is on, `POST /api/capture` answers `409`.
+- The mode does not refuse a learn (`POST /api/capture`, 5.2a): during a learn the receiver
+  records the learned press for that request and sends no `ir_received` event for it; the mode
+  stays reported on and pushes no `ir_capture` event. Presses before and after the learn are
+  events as usual. Turning the mode on or off during a learn answers at once: off stops the
+  receiver when the learn ends, on keeps the receiver the learn started.
 - The sensor is short-range: the remote about 5 to 8 cm above the Hub's upper side.
 - If the receiver stops delivering data (seen once on a Hub), the mode reports it in
   `GET /api/status` (`ir_capture_error`) and reopens the receiver every 5 s; a reboot clears it.
@@ -1481,12 +1669,12 @@ the one listed here) with the RF status of 7.1 and `200`, not `404`, and does no
 method and path given in this section: a `POST /api/rf/sync`, for example, only returns the status.
 
 Other `hub_rf` routes:
-- `GET` or `POST /api/rf/pull-config?slot={1|2}`: asks the remote to send its settings back
+- `GET` or `POST /api/rf/pull-config?slot={1..6}`: asks the remote to send its settings back
   (`RF_MSG_CONFIG_PULL_REQ`). `{"status":"pull_requested","slot":1,"ok":true}`; `400` for a
   Companion slot, `409` during an RF OTA.
 - `GET` or `POST /api/rf/log-level?level={0..3}`: sets `hub_rf`'s log level (3 = debug) until it
   restarts; without `level` it only reports it. `{"log_level":1,"ok":true}`.
-- `GET` or `POST /api/rf/push-icon?id=<id>&type=<type>&slot={0|1|2}`: sends a custom icon to the
+- `GET` or `POST /api/rf/push-icon?id=<id>&type=<type>&slot={0..6}`: sends a custom icon to the
   remote (slot `0` or none: every paired remote). `id` and `type` are 1 to 19 characters of
   `A-Z a-z 0-9 _ -` (`400` otherwise; `type` defaults to `activity`). The transfer runs in the
   background: the answer is `202` `{"status":"icon_push_started","id":"<id>","slot":0,"ok":true}`
@@ -1576,8 +1764,8 @@ Returns CC2544 radio state, paired remote slots, model identification, screen ca
   slot is `in_sync` when its remote reported the same number as `config_version` (always `true`
   for a Companion or Smart Control, which takes no configuration).
 - `ota`: the state of the RF firmware update, the same object as `GET /api/rf/ota-status` (7.5).
-- Both slot objects are always there, with every field; a slot without a remote has
-  `"active": false`. `sw_version`: the remote software's version as it reported it (`"unknown"`
+- The Hub has 6 remote slots (the CC2544 pipe table). Every slot is
+  listed, in slot order, with every field; a slot without a remote has `"active": false`. `sw_version`: the remote software's version as it reported it (`"unknown"`
   before its first report, `"N/A"` for a remote without a screen).
 - `slots[].link`: RF traffic with the remote since `hub_rf` started: protocol frames received, frames sent that wait for an ACK (resends included) and how many were ACKed, resends, sends the Hub's CC2544 refused (NAK), and seconds since the last frame from the remote (`-1` before the first).
 - `slots[].link.key_*`: key frames of a touchscreen remote since `hub_rf` started. A key frame is sent once, with no acknowledgement and no resend; a remote that numbers its key frames (`docs/HARMONY_RF_PROTOCOL.md`, `RF_MSG_BUTTON_PRESS`) lets the Hub count the ones that did not arrive. `key_events`: key frames received that carry a number. `key_events_lost`: numbers missing between them. The lost ones are split by what the frames around the gap show: `key_lost_press` (a hold or release arrived for a key whose press was not seen: the key did nothing or started late), `key_lost_release` (a key frame arrived while the key before it was still down: that key stayed down), `key_lost_other` (holds, or nothing to tell them by); the three add up to `key_events_lost`. All stay `0` for a remote that does not number its key frames (older remote software, Companion, Smart Control). Each gap is also one line in the Hub log: `[!] RF key events lost: slot 1, 2 missing before #57 (release DirectionRight)`. Like the other link counters they are read on request: a change does not send an `rf_status` event.
@@ -1621,7 +1809,7 @@ Returns CC2544 radio state, paired remote slots, model identification, screen ca
   {"ok": true, "running": false, "state": "stopped", "connected": false, "pairing_active": false,
    "paired": false, "rf_address": "None", "hub_rf_address": "None",
    "slots": [{"slot": 1, "active": false, "address": "None", "rf_address": "None"},
-             {"slot": 2, "active": false, "address": "None", "rf_address": "None"}]}
+             ... slots 2 to 6 the same]}
   ```
 
 #### `POST /api/rf/status-changed` (internal)
@@ -1631,29 +1819,46 @@ WebSocket event (10.12). Accepted from loopback only (`403` otherwise); the body
 object (`400` otherwise). Reply: `{"ok": true, "changed": true|false}`.
 
 ### 7.2 RF Pairing
-#### `GET /api/rf/pair?slot={1|2}` or `POST /api/rf/pair`
-Opens the Hub's pairing window for Harmony touchscreen remotes (Elite, Ultimate), Harmony Companion, or Harmony Smart Control remotes. The window closes by itself after 30 s (or with `stop-pair`). `slot` is accepted (`1`, `2`, `0` or `all`) but not used: the radio gives the remote the free slot.
+#### `GET /api/rf/pair?slot={1..6}` or `POST /api/rf/pair`
+Opens the Hub's pairing window for Harmony touchscreen remotes (Elite, Ultimate), Harmony Companion, or Harmony Smart Control remotes. The window closes by itself after 30 s (or with `stop-pair`).
+- **`slot` 1 to 6**: the remote that pairs goes to that slot. The CC2544 puts a new remote on a
+  radio pipe of its own choice; `hub_rf` then gives that pipe the chosen slot, and the slot that
+  pipe had takes the chosen slot's empty pipe. Maps, settings, the API and the logs use the slot;
+  only the radio frames name the pipe. The table is kept in `/data/harmony/rf_slot_map.txt` (the
+  pipe of slots 1 to 6, `1 2 3 4 5 6` until a pairing changes it; a broken file counts as that).
+  The pipe-table reply after the pairing decides: the pipe that holds a remote now and held none
+  when the window opened goes to the slot. A second request while the window is open changes the
+  slot; a cancel or a timeout drops the choice. The choice holds for 45 s, or 15 s after the
+  radio reports the pairing. A Hub that goes back to an older firmware ignores
+  `rf_slot_map.txt`: such a remote then shows up in the slot of its pipe. The slot table is part
+  of the backup bundle (`rf_slot_map`).
+- **Slots 3 to 6 after the update to six slots**: the Hub now reads the whole pipe table, so a
+  remote paired by an earlier owner, or a replaced Companion, shows up there. Unpair what you do
+  not know. A config push goes to a touchscreen remote (in any slot) only once it has sent a
+  frame since `hub_rf` started; one that has not stays pending and gets the push with its first
+  frame.
+- **Without `slot`** (or `0` / `all`): the remote takes the slot of the pipe the radio picks. The
+  Hub's pairing button pairs into the lowest slot without a remote.
 - **Response `200 OK`**: `{"status": "pairing_started"}` (also when the window is already open)
-- **Error `409`**: during an RF OTA.
+- **Error `409`**: during an RF OTA, or when the slot holds a remote (`"The slot holds a remote: unpair it first"`).
 
-#### `POST /api/rf/wake?slot={1|2}`
+#### `POST /api/rf/wake?slot={1..6}`
 Turns the remote's screen on over RF (`RF_MSG_WAKE`), as a key press would; with the screen already on it restarts the idle timeout. Returns `202` `{"status":"waking","slot":1,"ok":true}` at once and tries for about 10 s in the background; `hub_rf` logs whether the remote acknowledged it. One wake runs at a time (`202` `already_waking` while one runs); `409` during an RF OTA, `400` for a Companion slot. Remotes without this message do not answer. A remote in deep standby (suspended to RAM on battery) does not receive it either: it reports again at its next hourly alarm or key press. An RF OTA start (`/api/rf/ota-start`) sends the same request first (4 attempts). Over USB/SSH the same is `touch /tmp/trigger_wake` on the remote.
 
 #### `GET /api/rf/stop-pair` or `POST /api/rf/stop-pair`
 Stops active pairing mode.
 - **Response `200 OK`**: `{"status": "pairing_stopped"}`
 
-#### `GET /api/rf/unpair?slot={1|2}` or `POST /api/rf/unpair`
+#### `GET /api/rf/unpair?slot={1..6}` or `POST /api/rf/unpair`
 Unpairs target remote slot; without a slot (or with `slot=0` / `slot=all`) every remote.
 - **Response `200 OK`**: `{"status": "unpaired", "ok": true}`
 - **Error `409`**: during an RF OTA.
 
 The RF routes read `slot` from the query, or from a JSON body (`"slot": 1`) when the query has
-none. A value other than `1` or `2` is answered with `400`; `0` and `all` ("every remote") are
+none. A value other than `1` to `6` is answered with `400`; `0` and `all` ("every remote") are
 accepted by pair, unpair, sleep and push-icon only. Routes match the path exactly
 (`/api/rf/pairing-state` is not `/api/rf/pair`). For `POST /api/rf/remote-config`
-a `"slot"` of `1` or `2` in the body wins over the query, and for the `POST` of
-remote-direct-buttons a `"slot": 2` in the body does.
+a `"slot"` of `1` to `6` in the body wins over the query.
 
 ### 7.3 Raw RF Frame Transmit
 #### `GET /api/rf/send?hex={hex_stream}`
@@ -1664,10 +1869,10 @@ any other form gets the status object of 7.1.
   was sent; there is no `ok` field. `409` `{"error":"RF OTA in progress","ok":false}` during an RF OTA.
 
 ### 7.4 RF Remote Configuration & OTA Push
-#### `GET /api/rf/remote-config?slot={1|2}`
+#### `GET /api/rf/remote-config?slot={1..6}`
 Returns brightness, display timeout, tilt gyro, touch sensitivity, night mode, and nav button configuration for the touchscreen remote: the stored `/data/harmony/remote_slot<N>_config.json` (every setting under its camelCase name and its snake_case name, as the `POST` stores it), or the defaults when nothing was saved yet. For a Companion or Smart Control slot the answer is `{"slot": 2, "model": "companion", "has_screen": false, "supports_ota": false, "in_sync": true}`.
 
-#### `POST /api/rf/remote-config?slot={1|2}`
+#### `POST /api/rf/remote-config?slot={1..6}`
 Saves remote preferences and transmits push packet to the remote over RF. The body replaces the
 whole stored configuration: a setting left out is not kept, it is set to its default (below). Send
 every setting each time.
@@ -1679,7 +1884,6 @@ every setting each time.
     "touchEnabled": true,
     "capButtonsEnabled": true,
     "gyroEnabled": true,
-    "gyroRate": 50,
     "btnBacklight": 1,
     "nightStart": 22,
     "nightEnd": 7,
@@ -1693,7 +1897,7 @@ every setting each time.
   ```
   - Values used for a setting that is left out (and, where a range is given, for a value outside
     it): `brightness` 2, `timeout` 10 (seconds; a given value is kept within 5 to 600),
-    `touchEnabled` false, `capButtonsEnabled` true, `gyroEnabled` true, `gyroRate` 50,
+    `touchEnabled` false, `capButtonsEnabled` true, `gyroEnabled` true,
     `btnBacklight` 2 (0 to 2), `nightStart` 22 and `nightEnd` 7 (hours, 0 to 23), `navToggleKey`
     139, `navToggleMode` 1, `confirmActivity` false, `touchSensitivity` 2 (1 to 3), `usbEth` false.
   - More settings: `noScreen`, `debugLogging` (older name `powerDebug`), `language` (`en`, `de`,
@@ -1702,7 +1906,7 @@ every setting each time.
     forces `layout` `list`). All false, `en` and not set when left out.
   - `remoteMode` is ignored: `0` is always stored and sent.
   - Each setting is also read under its snake_case name (`touch`, `gyro`, `nav_key`, `nav_mode`,
-    `confirm_act`, `touch_sensitivity`, `gyro_rate`, `btn_backlight`, `night_start`, `night_end`,
+    `confirm_act`, `touch_sensitivity`, `btn_backlight`, `night_start`, `night_end`,
     `usbeth`, `cap_buttons`, `no_screen`, `debug_logging`, `language_id`, `physical_nav`).
 - **Response `200 OK`**: `{"status": "saved_and_pushed", "ok": true}`. The answer is the same when
   the remote did not acknowledge the push (asleep or out of range): the settings are stored, the
@@ -1719,18 +1923,18 @@ Increments config version and broadcasts instant over-the-air sync packet to rem
 Forces remote activity display synchronization with hub current state.
 - **Response `200 OK`**: `{"status": "synced"}`
 
-#### `GET /api/rf/sleep?slot={0|1|2}` or `POST /api/rf/sleep?slot={0|1|2}`
+#### `GET /api/rf/sleep?slot={0..6}` or `POST /api/rf/sleep?slot={0..6}`
 Puts paired touchscreen remotes to sleep (immediate Suspend-to-RAM on battery).
-- **Query Parameter**: `slot` (optional: `1` for remote 1, `2` for remote 2, `0` or omitted for all active remotes).
+- **Query Parameter**: `slot` (optional: `1` to `6` for that remote, `0` or omitted for all active remotes).
 - **Response `200 OK`**: `{"status": "sleep_dispatched", "slot": 1, "sent": 1, "ok": true}` (`slot` is `0` for "all"; `sent` counts the remotes the request was sent to; a Companion or Smart Control slot is skipped). `409` during an RF OTA.
-- **MQTT equivalent**: Publish to `<base>/remote/1/sleep` or `<base>/remote/2/sleep` (`<base>/remote/sleep` is slot 1). One slot per message: MQTT and the WebSocket action `rf_sleep` (10.7b) have no "all remotes" form.
-- **Home Assistant**: Auto-discovered as `button.<hub>_remote_1_sleep`.
+- **MQTT equivalent**: Publish to `<base>/remote/<n>/sleep`, `<n>` 1 to 6 (`<base>/remote/sleep` is slot 1). One slot per message: MQTT and the WebSocket action `rf_sleep` (10.7b) have no "all remotes" form.
+- **Home Assistant**: Auto-discovered as `button.<hub>_remote_<n>_sleep`, one per slot.
 
 ### 7.5 Direct Buttons & Firmware OTA (Touchscreen Remotes)
-#### `GET /api/rf/remote-direct-buttons?slot={1|2}`
+#### `GET /api/rf/remote-direct-buttons?slot={1..6}`
 Returns the stored direct-buttons file of the slot (`/data/harmony/remote_slot<N>_direct_buttons.json`), or `{"page1":[],"page2":[],"buttons":{}}` when there is none.
 
-#### `POST /api/rf/remote-direct-buttons?slot={1|2}`
+#### `POST /api/rf/remote-direct-buttons?slot={1..6}`
 Stores the request body as that file and answers `{"status":"saved","ok":true}` (`500` when the
 file cannot be written, `409` during an RF OTA). Kept for old clients only:
 the remote's direct mode was removed (every remote runs in activity mode, `remoteMode` is always
@@ -1752,7 +1956,7 @@ Returns remote firmware chunk update progress.
   }
   ```
 
-#### `POST /api/rf/ota-start?slot={1|2}`
+#### `POST /api/rf/ota-start?slot={1..6}`
 Starts background remote firmware update (touchscreen remotes only).
 - **Storage & Download Policy**:
   The Hub does not store remote OTA images on flash storage. If `/tmp/remote_ui.ota.gz` is not already present in RAM, the Hub downloads `manifest.json`, `manifest.json.sig` and the remote OTA image on-demand from the update repository into `/tmp`, and sends the image only when the manifest carries a valid release signature and the image matches its SHA-256 (see `POST /api/update-apply`). An image staged by hand without a manifest is sent as is.
@@ -1763,6 +1967,7 @@ Starts background remote firmware update (touchscreen remotes only).
   - `200 OK`: `{"status":"started","slot":1,"ok":true}` — OTA worker thread started.
   - `400 Bad Request`: `{"status":"unsupported","slot":1,"error":"Companion remotes do not support OTA","ok":false}` — slot holds a Companion remote (no screen/firmware OTA).
   - `409 Conflict`: `{"status":"already_in_progress","slot":1,"error":"RF OTA already in progress on slot 1","ok":false}` — an update or download is already running.
+  - `409 Conflict`: `{"status":"config_push_running","error":"A config push is running: start the update when it ends","ok":false}` — a config push is running. An update the remote asks for itself, or one started during a push, waits up to 60 s for the push before its transfer starts.
 - **Status reporting (`GET /api/rf/ota-status`)**:
   - `status: 0`: Idle.
   - `status: 3`: Downloading and verifying OTA image into `/tmp` (RF sync and ACKs remain unblocked).
@@ -1781,20 +1986,20 @@ Starts background remote firmware update (touchscreen remotes only).
 - **Staged image age**: an image in `/tmp/remote_ui.ota.gz` older than 2 hours is deleted when an update starts, and the published one is downloaded instead.
 
 ### 7.6 Physical Remote Key Mappings (Touchscreen Remotes, Companion, Smart Control)
-#### `GET /api/rf-mapping?slot={1|2}`
-Returns physical button and screen mappings for the remote in Slot 1 or Slot 2.
+#### `GET /api/rf-mapping?slot={1..6}`
+Returns physical button and screen mappings for the remote in the slot (1 to 6).
 - **Query Parameter**: `slot` (`1` or `2`, defaults to `1`).
-- **File Persistence**: Slot 1 uses `/data/harmony/remote_slot1_map.json`, slot 2 `/data/harmony/remote_slot2_map.json`. Only `POST /api/rf-mapping-copy` falls back to the old name `/data/harmony/elite_remote_map.json` when slot 1's file is missing.
+- **File Persistence**: Slot N (1 to 6) uses `/data/harmony/remote_slot<N>_map.json`. Only `POST /api/rf-mapping-copy` falls back to the old name `/data/harmony/elite_remote_map.json` when slot 1's file is missing.
 - **Remote Model Awareness**: Mappings apply to any paired remote in that slot: a Harmony touchscreen remote (Elite, Ultimate), Harmony Companion, or Harmony Smart Control.
 - **Which mapping a key uses**: the running activity's entry under `activities`. A key that activity does not map, or any key while nothing runs, uses the `"-1"` entry, then `"default"`, then the map's only activity when the map has exactly one. With several activities and neither `"-1"` nor `"default"`, the key is not sent. The "only activity" counts the non-empty entries in the map. A `"-1"` or `"default"` entry, or a key binding, that is not an object (`null` in a hand-edited map) binds nothing and ends the search. This also covers `activity_start` bindings: a Companion or Smart Control activity key bound in one activity's entry starts nothing from Off or from the other activities; put keys meant for every activity and for Off under `"-1"`. `PowerOffActivity` is handled before the map and always works. A key pressed while the remote browses a device uses that device's entry under `devices`, then the device command with the button's name.
 
-#### `POST /api/rf-mapping-save?slot={1|2}`
+#### `POST /api/rf-mapping-save?slot={1..6}`
 Saves button assignments for the specified slot. The body must be one JSON object of less than 262144 bytes (256 KB): `400` otherwise, `413` when larger; the stored mapping is then kept.
 - **Query Parameter**: `slot` (`1` or `2`, defaults to `1`).
 
-#### `POST /api/rf-mapping-copy?from={1|2}&to={1|2}`
+#### `POST /api/rf-mapping-copy?from={1..6}&to={1..6}`
 Copies entire button mapping configuration from one remote slot to another.
-- **Query Parameters**: `from` (source slot, 1 or 2, default 1), `to` (destination slot, 1 or 2, default 2). Both may also be given in a JSON body (`{"from": 1, "to": 2}`), which wins over the query.
+- **Query Parameters**: `from` (source slot, 1 to 6, default 1), `to` (destination slot, 1 to 6, default 2). Both may also be given in a JSON body (`{"from": 1, "to": 2}`), which wins over the query.
 - A source slot without a mapping file is copied as the empty mapping `{"activities":{},"devices":{}}`. The destination slot is marked as waiting for a push (`sync_pending`, 7.1).
 - **Response `200 OK`**:
   ```json
@@ -1812,7 +2017,7 @@ Saves virtual remote keypad layout for WebUI and Android App. The body must be o
 Answers of the mapping routes of this section: `GET /api/rf-mapping` returns the stored file as it
 is, or `{"ok": true, "mappings": []}` when the slot has none. `POST /api/rf-mapping-save` and
 `POST /api/ui-remote-layout` answer `{"ok": true}`, `500` when the file could not be written. In
-the body of `rf-mapping-save` a top-level `"slot": 2` wins over the query; the save marks the slot
+the body of `rf-mapping-save` a top-level `"slot"` of `2` to `6` wins over the query; the save marks the slot
 as waiting for a push (`sync_pending`, 7.1).
 
 ---
@@ -1912,8 +2117,8 @@ These are aliases of the command channel for existing automations and for the di
 | Topic | Payload | Does |
 | --- | --- | --- |
 | `<base>/activity/set` | an activity name, an activity id, `PowerOff` or `-1` | `start_activity` / `stop_activity` |
-| `<base>/send_command` | `{"device": "<name>"` or `"deviceId": "<id>", "command": "<cmd>"` or `"commands": [...]`, optional `repeats`, `delay` (s) or `delay_ms`, `hold` (s) or `hold_ms`, `action`}` | the commands in order, `repeats` times, `delay` apart (0.25 s default for more than one) |
-| `<base>/command/<device>/<command>` | any | one command to the device (id or name) |
+| `<base>/send_command` | `{"device": "<name>"` or `"deviceId": "<id>", "command": "<cmd>"` or `"commands": [...]`, optional `repeats`, `delay` (s) or `delay_ms`, `hold` (s) or `hold_ms`, `action`}` (no `value`: use `<base>/cmd` with the `send_command` action, 10.3, for a plugin command that takes one) | the commands in order, `repeats` times, `delay` apart (0.25 s default for more than one) |
+| `<base>/command/<device>/<command>` | any | one command to the device (id or name); a payload that is a plain integer is the command's `value` (plugin commands) |
 | `<base>/sync` | any | republishes every retained topic and the discovery entities |
 | `<base>/remote/<n>/sleep`, `<base>/remote/sleep` (slot 1) | any | `rf_sleep` |
 | `harmony/ir/pronto` | a Pronto hex code | sends it on every IR port once |
@@ -1925,7 +2130,8 @@ They answer nothing on `cmd/response`; use `<base>/cmd` for acknowledged command
 `delayMs` for `delay_ms`, `hold_secs` or `holdSecs` for `hold`, and `holdMs` for `hold_ms`.
 `action` is `press`, `hold` or `release` (a tap otherwise); `hold` without a hold time holds the
 key for 0.5 s. The limits of 10.3 apply (32 commands, 50 repeats, 60 s delay, 10 s hold, 16 jobs,
-300 s per job). `<base>/remote/<n>/sleep` takes slot 1 or 2 only: there is no "all remotes" topic.
+300 s per job). `<base>/remote/<n>/sleep` takes slot 1 to 6 only: there is no "all remotes" topic. Home Assistant
+discovery announces the sleep button of every slot.
 
 #### MQTT-type devices
 A device of type `MQTT` (or with `mqttEnabled`) is driven through the broker instead of IR or
@@ -1974,7 +2180,9 @@ whole here; only WebSocket replies cut it to 64); a request without `id`
 is executed and not answered. Actions and fields mirror the WebSocket actions (section 10):
 `ping`, `get_state`, `get_snapshot` (the reply carries the snapshot), `start_activity` (`activity`),
 `stop_activity`, `cancel_activity`, `cancel_commands`, `send_command` (`deviceId`, `command`, `status` = `press`,
-`hold`, `release` or omitted for a tap), `bt_key` (`key`, `keyAction`, `target`), `bt_text`,
+`hold`, `release` or omitted for a tap; `value`, an integer, for a single plugin command: one with a range needs
+it and answers `400` "value required" without; a list or `num_repeats` with such a command is refused the
+same way), `bt_key` (`key`, `keyAction`, `target`), `bt_text`,
 `bt_mouse`, `rf_wake` (`slot`), `rf_sleep` (`slot`), `sync`, `ir_raw` (fields of 5.4),
 `ir_capture` (`enabled`, 5.5; the reply carries `enabled`),
 `update_check`, `update_apply`, `activity_help`, `activity_help_answer` (10.6a, 10.6b).
@@ -2114,7 +2322,22 @@ Exports complete hub configuration bundle or individual configuration elements.
   - `wifi`
   - `bluetooth`
   - `bt_remote_map` (also `remote-mapping`)
-  - `remote_slot1_map`, `remote_slot2_map`
+  - `remote_slot1_map` to `remote_slot6_map`
+  - `rf_slot_map` (text: which radio pipe each slot is, six different numbers from 1 to 6, such
+    as `1 4 3 2 5 6`; `1 2 3 4 5 6` when the Hub has no table file. A bundle leaves out a file
+    that is no such table, which hub_rf ignores as well). `hub_rf` reads it at its start: after
+    an import that changes it, hub_daemon asks hub_rf to restart (`POST /api/rf/restart`), which
+    it does once no config push, update or pairing runs; `init.sh` starts it again within
+    seconds, and the remotes are off the air for that time. Before it ends, hub_rf moves each
+    remote's version file, battery and settings file (`remote_slot<N>_config.json`) to the slot
+    its radio pipe now is, so the new hub_rf shows every remote with its id and version in its
+    new slot and the next config push sends each remote its own settings. An import whose table equals the one
+    in use does not restart hub_rf. When hub_rf is not running the table applies at its next
+    start. It names the pipes of this Hub's radio: on another Hub, or after remotes were paired
+    again, it puts the maps on other remotes.
+    `POST /api/rf/restart` (answer `202 {"ok":true,"status":"restart_scheduled"}`) is a route of
+    hub_rf's loopback API, and hub_daemon's `/api/rf/` proxy on port 8089 passes it on too: there
+    it needs an administrator (any client while authentication is off), as the unpair route does.
   - `users` (the web UI accounts)
   - `ui_remote_layout` (also `ui-remote-layout`)
   - `auth`
@@ -2148,8 +2371,9 @@ as the new web UI calls it). An import of the accounts that turns authentication
   or of `users` ends every session.
 - Every section is checked before anything is written: `devices` must be an object with a `devices`
   array, `activities` an object with an `activities` array, and `settings`, `mqtt`, `bluetooth`,
-  `bt_remote_map`, `remote_slot1_map`, `remote_slot2_map`, `ui_remote_layout` and `users` JSON objects
-  (sent as objects, or as strings that parse completely). `network`, `wifi`, `auth` and `hub_id` are
+  `bt_remote_map`, `remote_slot1_map` to `remote_slot6_map`, `ui_remote_layout` and `users` JSON objects
+  (sent as objects, or as strings that parse completely). `rf_slot_map` must be text with six
+  different numbers from 1 to 6 (written as `a b c d e f`). `network`, `wifi`, `auth` and `hub_id` are
   text files and are written as sent. An empty `devices` or `activities` list in a bundle (what an
   export holds when the file could not be read) is skipped.
 - The new files are written under temporary names first and then renamed into place.
@@ -2257,6 +2481,9 @@ Multiple commands or repeats can be queued as an array:
   `press` and `hold` without `hold_secs` are sent as taps.
 - `ir_send` is another name of this action.
 - A single command with no repeat or hold is sent at once, unless a job is still running.
+- `live` (optional): `true` sends such a single command as a person's press, as `live` of
+  `POST /api/ir-send` (5.1). A list, repeats, holds and a command queued behind a job are never
+  live.
 
 **Response**:
 ```json
@@ -2402,7 +2629,7 @@ then arrive as `ir_received` (10.13b).
 ```json
 {"type": "ack", "action": "ir_capture", "ok": true, "msgId": 61, "enabled": true}
 ```
-A refused request (`409` or `503`, as in 5.5) carries `enabled` too, the state after the request,
+A refused request (`503`, as in 5.5) carries `enabled` too, the state after the request,
 next to `code` and `error`.
 
 #### 10.7 Bluetooth HID Key Simulation

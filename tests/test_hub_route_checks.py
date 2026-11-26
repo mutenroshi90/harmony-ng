@@ -13,6 +13,15 @@ Route checks of hub_daemon (port 9101, own mock root, clients bound to 127.0.0.2
  5  factory reset does not answer "initiated" when its script is not installed
  6  POST /api/settings refuses a timezone name the Hub does not know (it ran as CET)
  7  mqtt.json, which holds the broker password, is made readable by its owner only
+ 8  the stock resources delete needs a confirmation, the stock import and a mark whose fingerprint
+    matches the files (a saved copy of them as they are), never
+    follows a link at /data/resources, and reports a file it could not remove
+ 9  a packed icon archive (tools/icon_pack.py): icons are served from it, listed from its index,
+    and the copy an older firmware unpacked into /tmp is removed
+10  a packed icon archive of another pack version (after a downgrade) is unpacked into /tmp
+    (RAM) as a plain archive only when the free RAM allows it, logged once either way; a plain
+    tar.gz is unpacked whatever the RAM, by one extraction for 16 requests at once; the pack version of tools/icon_pack.py and the firmware
+    match
 """
 
 import base64
@@ -23,7 +32,9 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hub_harness import HubHarness  # noqa: E402
+from hub_harness import TMP_WWW, HubHarness  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+import backup_hub  # noqa: E402
 
 PORT = 9101
 HOST = "127.0.0.2"
@@ -40,13 +51,14 @@ def check(cond, name, detail=""):
         print("  FAIL %s %s" % (name, detail))
 
 
-def raw(method, path, body=b""):
+def raw(method, path, body=b"", binary=False):
+    """binary: the body as bytes, and Connection: close (a static file keeps the connection open)"""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind((HOST, 0))
     s.settimeout(8)
     s.connect((HOST, PORT))
-    s.sendall(("%s %s HTTP/1.1\r\nHost: %s:%d\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n"
-               % (method, path, HOST, PORT, len(body))).encode() + body)
+    s.sendall(("%s %s HTTP/1.1\r\nHost: %s:%d\r\nContent-Type: application/json\r\nContent-Length: %d\r\n%s\r\n"
+               % (method, path, HOST, PORT, len(body), "Connection: close\r\n" if binary else "")).encode() + body)
     out = b""
     try:
         while True:
@@ -62,6 +74,8 @@ def raw(method, path, body=b""):
     except (IndexError, ValueError):
         st = 0
     b = out.partition(b"\r\n\r\n")[2]
+    if binary:
+        return st, b
     try:
         return st, json.loads(b)
     except ValueError:
@@ -115,7 +129,7 @@ def upload(name, data):
 def test_icons():
     print("[-] 2  custom icons")
     tag = "p%d" % os.getpid()
-    tmp_icons = "/tmp/www/assets/icons"
+    tmp_icons = os.path.join(TMP_WWW, "assets", "icons")
     made = []
     with HubHarness(port=PORT, host=HOST, extra_root_files={"harmony/custom_icons/.keep": ""}) as hub:
         cache_icons = os.path.join(hub.mock_dir, "cache", "www", "assets", "icons")
@@ -174,6 +188,140 @@ def test_icons():
             pass
 
 
+def test_packed_icons():
+    print("[-] 9  stock icons read from the packed icon archive")
+    import icon_pack
+    import test_icon_pack
+    tag = "p%d" % os.getpid()
+    tmp_icons = os.path.join(TMP_WWW, "assets", "icons")
+    os.makedirs(tmp_icons, exist_ok=True)
+    with open(os.path.join(tmp_icons, "stale%s.png" % tag), "wb") as f:
+        f.write(PNG_SIG)
+    files = test_icon_pack.make_files()
+    with HubHarness(port=PORT, host=HOST) as hub:
+        os.makedirs(os.path.join(hub.mock_dir, "cache"), exist_ok=True)
+        archive = os.path.join(hub.mock_dir, "cache", "icons.tar.gz")
+        test_icon_pack.make_archive(archive, files)
+        icon_pack.pack(archive, archive)
+        st, b = raw("GET", "/assets/icons/shared.png", binary=True)
+        check(st == 200 and b == b"from-b", "folder icon by file name (later folder)", "%s %r" % (st, b[:20]))
+        st, b = raw("GET", "/assets/icons/a/shared.png", binary=True)
+        check(st == 200 and b == b"from-a", "icon by its folder path", "%s %r" % (st, b[:20]))
+        st, b = raw("GET", "/assets/icons/big.png", binary=True)
+        check(st == 200 and b == files["icons/big.png"], "icon larger than a part, byte for byte", str(st))
+        st, r = raw("GET", "/api/icons")
+        check(st == 200 and isinstance(r, list) and "top02.png" in r and "shared.png" in r
+              and not any("/" in n for n in r), "icon list from the index", repr(r)[:80])
+        st, r = raw("GET", "/api/status")
+        check(isinstance(r, dict) and r.get("has_icons") is True, "has_icons", repr(r)[:80])
+        st, b = raw("GET", "/api/icons/archive", binary=True)
+        check(st == 200 and b == read(archive), "archive route sends the packed archive as it is", str(st))
+        check(not os.path.exists(tmp_icons), "unpacked copy in /tmp removed")
+
+
+def wait_for_path(path, secs):
+    """True as soon as path exists, False after secs (the unpacking runs in its own thread)"""
+    end = time.time() + secs
+    while time.time() < end:
+        if os.path.exists(path):
+            return True
+        time.sleep(0.1)
+    return os.path.exists(path)
+
+
+def header_pack_version():
+    """ICON_PACK_VERSION from payload/source/icon_pack.h"""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "payload", "source", "icon_pack.h")) as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) >= 3 and parts[:2] == ["#define", "ICON_PACK_VERSION"]:
+                return int(parts[2])
+    return None
+
+
+def test_other_version_pack():
+    print("[-] 10 a packed icon archive of another pack version: unpacked into /tmp (RAM) only when it fits")
+    import shutil
+    import icon_pack
+    import test_icon_pack
+    check(header_pack_version() == icon_pack.EXTRA_VERSION, "tools/icon_pack.py and icon_pack.h: same pack version",
+          "%r %r" % (header_pack_version(), icon_pack.EXTRA_VERSION))
+    other = icon_pack.EXTRA_VERSION + 1
+    tmp_icons = os.path.join(TMP_WWW, "assets", "icons")
+    files = test_icon_pack.make_files()
+    log_path = os.path.join(TMP_WWW, "route_checks_%d.log" % os.getpid())
+    head = "pack version %d, this firmware reads version %d: " % (other, icon_pack.EXTRA_VERSION)
+    refused = head + "not unpacked into /tmp"
+    unpacked = head + "unpacked into /tmp as a plain archive"
+
+    def other_pack(archive):
+        test_icon_pack.make_archive(archive, files)
+        icon_pack.pack(archive, archive)
+        blob = bytearray(read(archive))
+        blob[16] = other  # pack version byte of the 'HI' gzip field
+        with open(archive + ".new", "wb") as f:
+            f.write(blob)
+        os.rename(archive + ".new", archive)
+
+    def log_count(msg):
+        with open(log_path, "rb") as f:
+            return f.read().decode(errors="replace").count(msg)
+
+    for free_kb, fits in (("1024", False), ("1048576", True)):
+        shutil.rmtree(tmp_icons, ignore_errors=True)
+        os.makedirs(os.path.join(TMP_WWW, "assets"), exist_ok=True)
+        try:
+            with HubHarness(port=PORT, host=HOST, log_path=log_path,
+                            env={"HARMONY_TEST_FREE_RAM_KB": free_kb, "HARMONY_TEST_EXTRACT_DELAY_MS": "200"}) as hub:
+                os.makedirs(os.path.join(hub.mock_dir, "cache"), exist_ok=True)
+                archive = os.path.join(hub.mock_dir, "cache", "icons.tar.gz")
+                other_pack(archive)
+                for _ in range(3):
+                    raw("GET", "/api/icons")
+                if not fits:
+                    st, b = raw("GET", "/assets/icons/shared.png", binary=True)
+                    check(st != 200, "%s KB free: icon of the version %d pack not served" % (free_kb, other),
+                          "%s %r" % (st, b[:20]))
+                    st, r = raw("GET", "/api/status")
+                    check(isinstance(r, dict) and r.get("has_icons") is False, "%s KB free: has_icons false" % free_kb,
+                          repr(r)[:80])
+                    check(not wait_for_path(tmp_icons, 3), "%s KB free: not unpacked into /tmp" % free_kb)
+                    n = log_count(refused)
+                    check(n == 1, "%s KB free: refusal logged once over three requests" % free_kb, "%d lines" % n)
+
+                    # a plain tar.gz is unpacked whatever the RAM, by one extraction even when
+                    # many HTTP workers ask for the icons at once
+                    test_icon_pack.make_archive(archive + ".new", files)
+                    os.rename(archive + ".new", archive)
+                    import threading
+                    workers = [threading.Thread(target=raw, args=("GET", "/api/icons")) for _ in range(16)]
+                    for w in workers:
+                        w.start()
+                    for w in workers:
+                        w.join()
+                    check(wait_for_path(os.path.join(tmp_icons, "shared.png"), 10),
+                          "%s KB free: plain archive unpacked into /tmp" % free_kb)
+                    time.sleep(1)
+                    n = log_count("[+] Unpacking icon archive ")
+                    check(n == 1, "%s KB free: 16 requests at once start one extraction" % free_kb, "%d" % n)
+                else:
+                    check(wait_for_path(os.path.join(tmp_icons, "shared.png"), 10),
+                          "%s KB free: version %d pack unpacked into /tmp" % (free_kb, other))
+                    st, b = raw("GET", "/assets/icons/shared.png", binary=True)
+                    check(st == 200 and b == files["icons/b/shared.png"], "%s KB free: icon served from /tmp" % free_kb,
+                          "%s %r" % (st, b[:20]))
+                    n = log_count(unpacked)
+                    check(n == 1, "%s KB free: unpacking logged once" % free_kb, "%d lines" % n)
+                    check(log_count(refused) == 0, "%s KB free: no refusal logged" % free_kb)
+        finally:
+            shutil.rmtree(tmp_icons, ignore_errors=True)
+            try:
+                os.unlink(log_path)
+            except OSError:
+                pass
+
+
 def test_query_params():
     print("[-] 3  query parameters, 4  log files")
     with HubHarness(port=PORT, host=HOST, extra_data_files={"mqtt.json": {"enabled": False, "password": "x"}}) as hub:
@@ -227,10 +375,87 @@ def test_query_params():
         check(st == 500, "missing script reported, not 'initiated'", "%s %s" % (st, r))
 
 
+def test_stock_resources():
+    print("[-] 8  stock resources delete")
+    stock = {"resources/DeviceList.json": "x" * 3000, "resources/sub/Context.json": "{}"}
+    clean = json.dumps({"action": "clean_stock_resources", "confirm": "EMPTY"}).encode()
+    with HubHarness(port=PORT, host=HOST, extra_root_files=stock) as hub:
+        res_dir = os.path.join(hub.mock_dir, "data", "resources")
+        saved = os.path.join(hub.data_dir, "stock_resources_saved")
+        st, r = raw("GET", "/api/disk-space")
+        check(st == 200 and r.get("stock_resources_kb") == 3 and r.get("stock_resources_saved") is False
+              and r.get("can_empty_stock_resources") is False, "disk fields before a saved copy", str(r))
+
+        st, r = raw("POST", "/system", json.dumps({"action": "clean_stock_resources"}).encode())
+        check(st == 400 and os.path.isfile(os.path.join(res_dir, "DeviceList.json")),
+              "no confirm: refused, files kept", "%s %s" % (st, r))
+        st, r = raw("POST", "/system", clean)
+        check(st == 409 and os.path.isfile(os.path.join(res_dir, "DeviceList.json")),
+              "no saved copy: refused, files kept", "%s %s" % (st, r))
+
+        def mark(files):
+            with open(saved, "w") as f:
+                f.write("stock_resources_test.tar %s\n" % backup_hub.stock_fingerprint(files))
+
+        # A mark from other files (changed since they were saved): refused
+        mark({"DeviceList.json": (2999, ""), "sub/Context.json": (2, "")})
+        st, r = raw("POST", "/system", clean)
+        check(st == 409 and os.path.isfile(os.path.join(res_dir, "DeviceList.json")),
+              "stale mark: refused, files kept", "%s %s" % (st, r))
+        mark({"DeviceList.json": (3000, ""), "sub/Context.json": (2, "")})
+
+        devices = os.path.join(hub.data_dir, "config", "devices.json")
+        with open(devices, "rb") as f:
+            devices_body = f.read()
+        open(devices, "w").close()  # a cut upload
+        st, r = raw("POST", "/system", clean)
+        check(st == 409 and os.path.isfile(os.path.join(res_dir, "DeviceList.json")),
+              "empty devices.json: refused, files kept", "%s %s" % (st, r))
+        os.unlink(devices)
+        st, r = raw("POST", "/system", clean)
+        check(st == 409 and os.path.isfile(os.path.join(res_dir, "DeviceList.json")),
+              "stock config not imported: refused, files kept", "%s %s" % (st, r))
+        with open(devices, "wb") as f:
+            f.write(devices_body)
+
+        st, r = raw("GET", "/api/disk-space")
+        check(r.get("can_empty_stock_resources") is True, "can empty with a saved copy", str(r))
+        st, r = raw("POST", "/system", clean)
+        check(st == 200 and isinstance(r, dict) and r.get("stock_resources_kb") == 0
+              and isinstance(r.get("freed_kb"), (int, float)) and os.listdir(res_dir) == [],
+              "emptied, directory kept", "%s %s" % (st, r))
+
+        # A link at /data/resources: its target is never emptied
+        target = os.path.join(hub.mock_dir, "elsewhere")
+        os.makedirs(target)
+        with open(os.path.join(target, "keep.json"), "w") as f:
+            f.write("{}")
+        os.rmdir(res_dir)
+        os.symlink(target, res_dir)
+        st, r = raw("POST", "/system", clean)
+        check(st == 409 and os.path.isfile(os.path.join(target, "keep.json")),
+              "link at /data/resources: refused, target kept", "%s %s" % (st, r))
+        os.unlink(res_dir)
+
+        # Not removable (a read-only directory): an error, never "emptied" (root can write anywhere)
+        if os.geteuid() != 0:
+            os.makedirs(os.path.join(res_dir, "ro"))
+            with open(os.path.join(res_dir, "ro", "f.json"), "w") as f:
+                f.write("{}")
+            os.chmod(os.path.join(res_dir, "ro"), 0o555)
+            mark({"ro/f.json": (2, "")})
+            st, r = raw("POST", "/system", clean)
+            os.chmod(os.path.join(res_dir, "ro"), 0o755)
+            check(st == 500, "file not removable: 500", "%s %s" % (st, r))
+
+
 def main():
     test_map_saves()
     test_icons()
+    test_packed_icons()
+    test_other_version_pack()
     test_query_params()
+    test_stock_resources()
     if failed:
         print("[-] %d check(s) failed" % failed)
         sys.exit(1)

@@ -24,6 +24,8 @@ import unittest
 REPO_DIR = pathlib.Path(__file__).resolve().parent.parent
 SCRIPT = REPO_DIR / "payload" / "scripts" / "update.sh"
 
+# A whole Ed25519 public key line (the Hub's key check wants the full 68-character blob)
+ED_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAiiACbtw7zFBaJ9uICKf3GGoYrHCkZPnK1d7B0o4saR owner"
 OLD_VER = "2.4.2"
 NEW_VER = "2.9.9"
 REPO = "http://pkg.invalid/ota"
@@ -132,6 +134,13 @@ class UpdateApply(unittest.TestCase):
         # the end of a good update: init.sh restart (old and new init.sh record the call)
         self.write(self.data / "init.sh", self.restart_script(), 0o755)
 
+        # root's home is inside the sandbox and holds an Ed25519 key: the package's SSH server
+        # (Ed25519 user keys only) may be installed. Without this the guard read the host's
+        # /home/root and the result depended on the machine.
+        self.auth_keys = self.root / "home/root/.ssh/authorized_keys"
+        self.write(self.root / "etc/passwd", f"root:x:0:0:root:{self.root}/home/root:/bin/sh\n")
+        self.write(self.auth_keys, ED_KEY + "\n", 0o600)
+
         # New release in the served directory
         serve = self.root / "serve"
         self.write(serve / "manifest.json", f'{{"version": "{NEW_VER}", "files": {{}}}}\n')
@@ -171,12 +180,14 @@ class UpdateApply(unittest.TestCase):
         path.write_text(text)
         path.chmod(mode)
 
-    def serve_bundle(self) -> None:
+    def serve_bundle(self, server_name: str = "bin/dropbearmulti_ed25519") -> None:
+        """The package as publish_ota.py builds it: the SSH server as bin/dropbearmulti_ed25519,
+        a name the update.sh of v2.5.3 and older does not install"""
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
             for name, body in self.new_files.items():
                 data = body.encode()
-                info = tarfile.TarInfo(name)
+                info = tarfile.TarInfo(server_name if name == "bin/dropbearmulti" else name)
                 info.size = len(data)
                 info.mode = 0o755
                 tar.addfile(info, io.BytesIO(data))
@@ -262,14 +273,65 @@ class UpdateApply(unittest.TestCase):
         self.assertTrue((self.data / "bin" / "dropbear").is_symlink())
         self.assertTrue((self.root / "usr" / "sbin" / "scp").is_symlink())
 
-    def test_link_dropbear_preserves_data_dropbear_when_mismatched(self):
+    def test_link_dropbear_removes_old_copies_once_the_package_server_is_installed(self):
+        """A Hub not deduped yet: the copies of the USB root tool differ from the package's server"""
         data_dropbear = self.root / "data" / "dropbearmulti"
-        self.write(data_dropbear, "custom non-canonical dropbear binary\n", 0o755)
+        usr_dropbear = self.root / "usr" / "sbin" / "dropbearmulti"
+        self.write(data_dropbear, "server of an older release\n", 0o755)
+        self.write(usr_dropbear, "#!/bin/sh\n# boot script + server of an older release\n", 0o755)
         self.serve_bundle()
         r = self.run_apply()
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertTrue(data_dropbear.exists(), "/data/dropbearmulti must be preserved when hash differs")
-        self.assertEqual(data_dropbear.read_text(), "custom non-canonical dropbear binary\n")
+        self.assertEqual((self.data / "bin" / "dropbearmulti").read_text(), self.new_files["bin/dropbearmulti"])
+        self.assertFalse(data_dropbear.exists(), "/data/dropbearmulti stays next to the installed package server")
+        self.assertFalse(usr_dropbear.exists())
+
+    def test_older_package_name_still_installed(self):
+        """A package that carries bin/dropbearmulti (an older release's layout) installs as before"""
+        self.serve_bundle(server_name="bin/dropbearmulti")
+        r = self.run_apply()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual((self.data / "bin" / "dropbearmulti").read_text(), self.new_files["bin/dropbearmulti"])
+
+    def test_no_ed25519_user_key_keeps_the_ssh_server(self):
+        """The package's server takes Ed25519 user keys only: without one the current server and
+        its copies stay, the rest of the release is installed. A comment or another key's comment
+        with the word ssh-ed25519 does not count."""
+        cases = (("no file", None),
+                 ("rsa only", "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQfake owner\n"),
+                 ("commented out", "ssh-rsa AAAAB3Nfake owner\n# ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFake old\n"),
+                 ("word in a comment", "ssh-rsa AAAAB3Nfake replaces ssh-ed25519 key of old pc\n"),
+                 # lines that hold an Ed25519 key but that dropbear does not take for it
+                 ("Ed25519 key as an RSA key's comment", f"ssh-rsa AAAAB3Nfake {ED_KEY}\n"),
+                 ("RSA and Ed25519 lines joined", f"ssh-rsa AAAAB3Nfake owner {ED_KEY}\n"),
+                 ("key cut after the prefix", "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI owner\n"))
+        for label, keys in cases:
+            with self.subTest(keys=label):
+                self.tearDown()
+                self.setUp()
+                if keys is None:
+                    self.auth_keys.unlink()
+                else:
+                    self.auth_keys.write_text(keys)
+                old_server = (self.data / "bin" / "dropbearmulti").read_text()
+                data_dropbear = self.root / "data" / "dropbearmulti"
+                self.write(data_dropbear, "server of an older release\n", 0o755)
+                self.serve_bundle()
+                r = self.run_apply()
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertEqual((self.data / "bin" / "dropbearmulti").read_text(), old_server)
+                self.assertTrue(data_dropbear.exists(), "the old copy must stay while the old server does")
+                self.assertIn("dropbearmulti not updated", r.stdout)
+                self.assertEqual((self.data / "bin" / "hub_daemon").read_text(), self.new_files["bin/hub_daemon"])
+                self.assertEqual(self.version(), NEW_VER)
+                self.assertEqual(self.leftovers(), [])
+
+    def test_key_with_options_counts(self):
+        self.auth_keys.write_text(f'no-port-forwarding {ED_KEY}\n')
+        self.serve_bundle()
+        r = self.run_apply()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual((self.data / "bin" / "dropbearmulti").read_text(), self.new_files["bin/dropbearmulti"])
 
     def data_used(self) -> int:
         return sum(p.stat().st_size for p in (self.root / "data").rglob("*") if p.is_file())
@@ -358,6 +420,52 @@ class UpdateApply(unittest.TestCase):
             self.assertEqual((self.data / "bin" / b).read_text(), self.new_files[f"bin/{b}"], b)
         self.assertEqual(self.version(), NEW_VER)
 
+
+    def run_repair(self) -> subprocess.CompletedProcess[str]:
+        env = {"PATH": f"{self.root / 'fakebin'}:/usr/bin:/bin", "UPD_SERVE": str(self.root / "serve")}
+        return subprocess.run(["sh", str(self.script), "repair-tls", REPO], capture_output=True, text=True,
+                              timeout=60, env=env)
+
+    def serve_repair(self, lib: bool = True, listed: bool = True) -> None:
+        """The installed release (OLD_VER) with hub_fetch and the library as files of their own"""
+        files = '"bin/mips/hub_fetch": {}' + (', "lib/libbearssl.so.0": {}' if listed else "")
+        self.write(self.root / "serve" / "manifest.json", f'{{"version": "{OLD_VER}", "files": {{{files}}}}}\n')
+        self.write(self.root / "serve" / "bin" / "mips" / "hub_fetch", "fetch\n")
+        if lib:
+            self.write(self.root / "serve" / "lib" / "libbearssl.so.0", "lib\n")
+
+    def test_repair_tls_installs_both(self):
+        self.serve_repair()
+        r = self.run_repair()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual((self.data / "bin" / "hub_fetch").read_text(), "fetch\n")
+        self.assertEqual((self.data / "lib" / "libbearssl.so.0").read_text(), "lib\n")
+
+    def test_repair_tls_not_done_with_a_file_missing(self):
+        """hub_fetch without the library does no TLS: the repair is tried again"""
+        for lib, listed in ((False, True), (True, False)):
+            with self.subTest(lib=lib, listed=listed):
+                self.tearDown()
+                self.setUp()
+                self.serve_repair(lib=lib, listed=listed)
+                r = self.run_repair()
+                self.assertNotEqual(r.returncode, 0, r.stdout)
+                self.assertIn("still missing", r.stdout)
+
+    def test_repair_tls_takes_over_a_stale_lock(self):
+        lock = self.root / "tmp" / "ota_update.lock"
+        lock.mkdir()
+        (lock / "pid").write_text("999999\n")
+        self.serve_repair()
+        r = self.run_repair()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(lock.exists())
+
+    def test_repair_tls_newer_release_installs_nothing(self):
+        self.serve_repair()
+        self.write(self.root / "serve" / "manifest.json", f'{{"version": "{NEW_VER}", "files": {{}}}}\n')
+        r = self.run_repair()
+        self.assertFalse((self.data / "bin" / "hub_fetch").exists())
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

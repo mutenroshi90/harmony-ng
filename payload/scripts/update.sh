@@ -10,11 +10,25 @@ else
   BB="busybox"
 fi
 
-# busybox wget does not verify TLS certificates, so nothing downloaded here is trusted until
-# hub_util ota-verify has checked it: the Ed25519 signature of manifest.json against the release
-# keys built into the firmware, then the SHA-256 of every file against the signed manifest.
+# Downloads use hub_fetch, which checks the server certificate against the CA bundle (it loads
+# /data/harmony/lib/libbearssl.so.0; the stock ld-uClibc ignores rpath, hence LD_LIBRARY_PATH).
+# busybox wget (checks no certificate) is used only when hub_fetch or its library is missing (a
+# Hub still on an older release) or the CA bundle is missing. Either way nothing downloaded here is trusted
+# until hub_util ota-verify has checked it: the Ed25519 signature of manifest.json against the
+# release keys built into the firmware, then the SHA-256 of every file against the signed manifest.
+# So when the certificate check fails (a clock not set yet, a server on a root outside the bundle),
+# a file the signature covers is fetched again without it (and without the token of a private
+# source) and the signature decides, as before hub_fetch existed: otherwise the update that would
+# bring a new CA bundle could never be fetched. The version check (VERSION files, the GitHub
+# release list) is never fetched that way: nothing signs it.
 WGET="$BB wget"
 HUB_UTIL=/data/harmony/bin/hub_util
+HUB_FETCH=/data/harmony/bin/hub_fetch
+HUB_LIB=/data/harmony/lib
+CA_BUNDLE=/data/harmony/cacert.pem
+USE_FETCH=""
+# Largest download kept in /tmp (RAM): a wrong server cannot fill it
+FETCH_MAX=16777216
 TAR="$BB tar"
 
 CMD="${1:-apply}"
@@ -34,7 +48,7 @@ else
 fi
 
 DEFAULT_OTA="https://raw.githubusercontent.com/iranl/harmony-ng/ota"
-if [ "$CMD" = "remote" -o "$CMD" = "elite" -o "$CMD" = "fetch-remote" -o "$CMD" = "fetch-remote-ota" ] && [ -z "$REPO_ARG" ] && [ -f /data/harmony/update_state.conf ]; then
+if [ "$CMD" = "remote" -o "$CMD" = "elite" -o "$CMD" = "fetch-remote" -o "$CMD" = "fetch-remote-ota" -o "$CMD" = "repair-tls" ] && [ -z "$REPO_ARG" ] && [ -f /data/harmony/update_state.conf ]; then
   CONF_REPO=$(grep '^source=' /data/harmony/update_state.conf 2>/dev/null | cut -d= -f2- | tr -d '\r\n ')
   [ -n "$CONF_REPO" ] && REPO_ARG="$CONF_REPO"
 fi
@@ -57,26 +71,97 @@ set_update_state() {
   { echo "state=$1"; [ -z "$2" ] || echo "version=$2"; [ -z "$_since" ] || echo "since=$_since"; } > "$UPDATE_STATE" 2>/dev/null || true
 }
 
+# fetch_once URL DST TIMEOUT OPTION...: one hub_fetch run; its messages go to stderr and to
+# $FETCH_ERR. The token goes in a header file (mode 600), not on the command line (ps shows it).
+# FETCH_NO_TOKEN=1: sent without the token (a server whose certificate was not checked).
+# FETCH_TOKEN: the token for this download (download_retry sets it; empty off the source).
+FETCH_ERR=/tmp/.update_fetch.$$.err
+FETCH_HDR=/tmp/.update_fetch.$$.hdr
+FETCH_NO_TOKEN=
+FETCH_TOKEN=
+fetch_once() {
+  _u="$1"; _d="$2"; _t="$3"; shift 3
+  if [ -n "$FETCH_TOKEN" ] && [ -z "$FETCH_NO_TOKEN" ]; then
+    (umask 077; echo "Authorization: token ${FETCH_TOKEN}" > "$FETCH_HDR")
+    LD_LIBRARY_PATH="$HUB_LIB" "$HUB_FETCH" -T "$_t" --max "$FETCH_MAX" --header-file "$FETCH_HDR" "$@" -o "$_d" "$_u" 2>"$FETCH_ERR"
+  else
+    LD_LIBRARY_PATH="$HUB_LIB" "$HUB_FETCH" -T "$_t" --max "$FETCH_MAX" "$@" -o "$_d" "$_u" 2>"$FETCH_ERR"
+  fi
+  _rc=$?
+  rm -f "$FETCH_HDR" 2>/dev/null
+  cat "$FETCH_ERR" >&2 2>/dev/null
+  return $_rc
+}
+
+# download_retry URL DST [TIMEOUT] [ATTEMPTS] [signed]: "signed" marks a file the release signature
+# covers (the manifest, its signature, and files checked against the signed manifest before use).
+# Only such a file is fetched again without the certificate check when TLS fails, and never with
+# the token. Anything else (VERSION files, the GitHub release list) is not: an unchecked server
+# could show any version and would get the token of a private source.
 download_retry() {
   local url="$1"
   local dst="$2"
   local timeout="${3:-12}"
   local max_attempts="${4:-3}"
+  local signed="$5"
   local i=1
+  # The token is for the configured source only. The one URL elsewhere is the GitHub release
+  # list (do_check's fallback): asked only for the GitHub repository the source is on (the
+  # default source: the public project), never for another source, and never with the token (a
+  # private source's token went to GitHub).
+  FETCH_TOKEN="$TOKEN_ARG"
+  case "$url" in
+    "$REPO"/*) ;;
+    https://api.github.com/*)
+      case "$REPO" in
+        https://raw.githubusercontent.com/*/*) ;;
+        *) return 1 ;;
+      esac
+      _gh_repo=$(echo "${REPO#https://raw.githubusercontent.com/}" | cut -d/ -f1-2)
+      case "$url" in
+        "https://api.github.com/repos/$_gh_repo/"*) ;;
+        *) return 1 ;;
+      esac
+      FETCH_TOKEN="" ;;
+    *) FETCH_TOKEN="" ;;
+  esac
+  if [ -z "$USE_FETCH" ]; then
+    USE_FETCH=0
+    if [ -x "$HUB_FETCH" ] && [ -s "$CA_BUNDLE" ] && LD_LIBRARY_PATH="$HUB_LIB" "$HUB_FETCH" --probe >/dev/null 2>&1; then
+      USE_FETCH=1
+    fi
+  fi
   while [ $i -le $max_attempts ]; do
     rm -f "$dst" 2>/dev/null
     # the header is one argument: unquoted, the token was passed to wget as extra URLs
-    if [ -n "$TOKEN_ARG" ]; then
-      $WGET -q -T "$timeout" --header "Authorization: token ${TOKEN_ARG}" -O "$dst" "$url" 2>/dev/null
+    if [ "$USE_FETCH" = 1 ]; then
+      fetch_once "$url" "$dst" "$timeout" --ca "$CA_BUNDLE"
+      # any TLS failure (a certificate, an unsupported signature, "TLS error N"): for a signed
+      # update file the release signature decides, not TLS
+      if [ ! -s "$dst" ] && grep -q 'TLS' "$FETCH_ERR" 2>/dev/null; then
+        _why=$(sed -n 's/^hub_fetch: [^ ]*: //p' "$FETCH_ERR" | sed -n 1p)
+        if [ "$signed" = signed ]; then
+          echo "[!] ${url%%\?*}: ${_why}. Fetched again without the certificate check and without the token: the release signature decides." >&2
+          FETCH_NO_TOKEN=1
+          fetch_once "$url" "$dst" "$timeout" --insecure
+          FETCH_NO_TOKEN=
+        else
+          echo "[!] ${url%%\?*}: ${_why}. Not fetched without the certificate check: no signature covers this file." >&2
+        fi
+      fi
+    elif [ -n "$FETCH_TOKEN" ]; then
+      $WGET -q -T "$timeout" --header "Authorization: token ${FETCH_TOKEN}" -O "$dst" "$url" 2>/dev/null
     else
       $WGET -q -T "$timeout" -O "$dst" "$url" 2>/dev/null
     fi
     if [ -s "$dst" ]; then
+      rm -f "$FETCH_ERR" 2>/dev/null
       return 0
     fi
     sleep 1
     i=$((i + 1))
   done
+  rm -f "$FETCH_ERR" 2>/dev/null
   return 1
 }
 
@@ -85,11 +170,11 @@ download_retry() {
 fetch_signed_manifest() {
   local dir="$1"
   rm -f "$dir/manifest.json" "$dir/manifest.json.sig"
-  if ! download_retry "${REPO}/manifest.json?_=${TIMESTAMP}" "$dir/manifest.json" 10 3; then
+  if ! download_retry "${REPO}/manifest.json?_=${TIMESTAMP}" "$dir/manifest.json" 10 3 signed; then
     echo "[-] Release manifest (manifest.json) missing from ${REPO}." >&2
     return 1
   fi
-  if ! download_retry "${REPO}/manifest.json.sig?_=${TIMESTAMP}" "$dir/manifest.json.sig" 10 3; then
+  if ! download_retry "${REPO}/manifest.json.sig?_=${TIMESTAMP}" "$dir/manifest.json.sig" 10 3 signed; then
     echo "[-] Release signature (manifest.json.sig) missing from ${REPO}." >&2
     return 1
   fi
@@ -148,7 +233,7 @@ install_file() {
 }
 
 # Binaries of the unified package that go to /data/harmony/bin
-BUNDLE_BINS="hub_daemon hub_rf hub_btstack dropbearmulti hub_sync register_ehci eth_fix"
+BUNDLE_BINS="hub_daemon hub_fetch hub_rf hub_btstack dropbearmulti hub_sync register_ehci eth_fix"
 
 # install_bundle PKG: install every file of the unpacked package; stops at the first failure.
 install_bundle() {
@@ -171,9 +256,26 @@ install_bundle() {
   fi
   # B. Application binaries -> /data/harmony/bin/
   for _b in hub_util $BUNDLE_BINS; do
-    if [ -f "$_pkg/bin/$_b" ]; then
-      install_file "$_pkg/bin/$_b" "/data/harmony/bin/$_b" 755 || return 1
+    _src="$_pkg/bin/$_b"
+    if [ "$_b" = dropbearmulti ]; then
+      # bin/dropbearmulti_ed25519: a name the update.sh of v2.5.3 and older does not install
+      _src=$(pkg_dropbear "$_pkg")
+      if [ -n "$_src" ] && ! has_ed25519_user_key; then
+        # The package's SSH server takes Ed25519 user keys only: the current one stays, or the
+        # next restart would lock root out
+        echo "[!] dropbearmulti not updated: root's authorized_keys has no Ed25519 key (the new SSH server takes Ed25519 keys only)."
+        continue
+      fi
     fi
+    if [ -n "$_src" ] && [ -f "$_src" ]; then
+      install_file "$_src" "/data/harmony/bin/$_b" 755 || return 1
+    fi
+  done
+  # Shared libraries for plugins (libbearssl.so.0) -> /data/harmony/lib/
+  for _f in "$_pkg/lib/"*; do
+    [ -f "$_f" ] || continue
+    mkdir -p /data/harmony/lib 2>/dev/null
+    install_file "$_f" "/data/harmony/lib/${_f##*/}" 755 || return 1
   done
   # C. BusyBox -> /cache/bin/
   if [ -f "$_pkg/bin/busybox" ]; then
@@ -194,20 +296,60 @@ link_hub_util() {
   done
 }
 
+# The package's SSH server: bin/dropbearmulti_ed25519, or bin/dropbearmulti of an older package
+pkg_dropbear() {
+  if [ -f "$1/bin/dropbearmulti_ed25519" ]; then
+    echo "$1/bin/dropbearmulti_ed25519"
+  elif [ -f "$1/bin/dropbearmulti" ]; then
+    echo "$1/bin/dropbearmulti"
+  fi
+}
+
+# Root's authorized_keys (dropbear reads the one in root's home) holds an Ed25519 key line in the
+# shape dropbear reads: the key type at the very start of the line, or after one options field and
+# one blank (blanks before the options are allowed; option names are not checked), then one space
+# and the whole 68-character key blob, then a space or the end of the line. Not a comment, not a
+# key whose first word is another key type, not a cut or joined key, not "ssh-ed25519" in another
+# key's comment. The same patterns are in build/deploy_hub.py (ED25519_KEY_SKIP,
+# ED25519_KEY_LINE); stock BusyBox 1.13.4 grep.
+has_ed25519_user_key() {
+  _home=$(awk -F: '$1=="root"{print $6}' /etc/passwd 2>/dev/null)
+  _ak="${_home:-/home/root}/.ssh/authorized_keys"
+  [ -f "$_ak" ] || return 1
+  grep -v '^[[:blank:]]*#' "$_ak" 2>/dev/null |
+    grep -v '^[[:blank:]]*\(ssh-\|ecdsa-\|sk-\)[^[:blank:]]*[[:blank:]]ssh-ed25519 ' |
+    grep -q '^\([[:blank:]]*\([^[:blank:]"]\|"[^"]*"\)\{1,\}[[:blank:]]\)\{0,1\}ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]\{43\}\( \|$\)'
+}
+
+# link_dropbear [PKG_BINARY]: the multi-call links. Given the package's dropbearmulti (checked
+# against the signed manifest), the old copies of the USB root tool and of the serial guide go
+# once the installed copy is that binary.
 link_dropbear() {
   if [ -s /data/harmony/bin/dropbearmulti ] && [ -x /data/harmony/bin/dropbearmulti ]; then
-    for _app in dropbear dropbearkey dbclient scp; do
+    for _app in dropbear dropbearkey scp; do
       [ -f "/data/harmony/bin/$_app" ] && [ ! -L "/data/harmony/bin/$_app" ] && rm -f "/data/harmony/bin/$_app" 2>/dev/null || true
       ln -sf /data/harmony/bin/dropbearmulti "/data/harmony/bin/$_app" 2>/dev/null || true
     done
-    for _app in dropbearkey dbclient scp; do
+    for _app in dropbearkey scp; do
       ln -sf /data/harmony/bin/dropbearmulti "/usr/sbin/$_app" 2>/dev/null || true
+    done
+    # the server has no client: the dbclient links of older installs go
+    for _l in /data/harmony/bin/dbclient /usr/sbin/dbclient; do
+      [ -L "$_l" ] && rm -f "$_l" 2>/dev/null
     done
     _harm_m=$(md5sum /data/harmony/bin/dropbearmulti 2>/dev/null | awk '{print $1}')
     _data_m=$(md5sum /data/dropbearmulti 2>/dev/null | awk '{print $1}')
-    if [ -n "$_harm_m" ] && { [ "$_harm_m" = "$_data_m" ] || [ "$_harm_m" = "3733327fd04bca282dbf06f33da0bf6c" ]; }; then
+    _pkg_m=""
+    [ -n "$1" ] && [ -f "$1" ] && _pkg_m=$(md5sum "$1" 2>/dev/null | awk '{print $1}')
+    if [ -n "$_harm_m" ] && { [ "$_harm_m" = "$_data_m" ] || [ "$_harm_m" = "$_pkg_m" ]; }; then
       rm -f /data/dropbearmulti /usr/sbin/dropbearmulti 2>/dev/null || true
     fi
+    # the server loads only an Ed25519 host key: made now, not at the first login (-R). An empty
+    # file is removed first: dropbearkey answers "File exists" and the server exits on it.
+    [ -f /etc/dropbear/dropbear_ed25519_host_key ] && [ ! -s /etc/dropbear/dropbear_ed25519_host_key ] && \
+      rm -f /etc/dropbear/dropbear_ed25519_host_key
+    [ -s /etc/dropbear/dropbear_ed25519_host_key ] || \
+      /data/harmony/bin/dropbearmulti dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key >/dev/null 2>&1 || true
   fi
 }
 
@@ -440,7 +582,7 @@ do_apply() {
   OTA_BUNDLE_OK=0
   INSTALL_OK=0
   echo "[*] Checking for unified Hub package (hub_ota.tar.gz)..."
-  if download_retry "${REPO}/hub_ota.tar.gz?_=${TIMESTAMP}" "$TMPDIR/hub_ota.tar.gz" 35 3; then
+  if download_retry "${REPO}/hub_ota.tar.gz?_=${TIMESTAMP}" "$TMPDIR/hub_ota.tar.gz" 35 3 signed; then
     echo "[+] Downloaded unified OTA package to RAM ($TMPDIR/hub_ota.tar.gz)."
 
     # The package must match the SHA-256 in the signed manifest
@@ -468,7 +610,7 @@ do_apply() {
       if [ -f "$TMPDIR/pkg/bin/hub_util" ]; then
         link_hub_util
       fi
-      link_dropbear
+      link_dropbear "$(pkg_dropbear "$TMPDIR/pkg")"
       # The package no longer has the recovery access point: its script, settings and the
       # hub_util links it used go (one still running stops at the next reboot)
       rm -f /data/harmony/recovery_ap.sh /data/harmony/scripts/recovery_ap.sh /data/harmony/bin/recovery_ap.sh \
@@ -480,7 +622,12 @@ do_apply() {
       # D. Install extended BusyBox applets strictly to /cache/bin (/bin/sh is NEVER touched)
       rm -f /data/bin/sh /data/bin/ash /data/bin/busybox 2>/dev/null || true
       if [ -x /cache/bin/busybox ]; then
-        /cache/bin/busybox --install -s /cache/bin 2>/dev/null || true
+        # Links to busybox in /usr/bin (older deploys) and of removed applets in /cache/bin go
+        _bb=/cache/bin/busybox
+        for _l in /usr/bin/* /cache/bin/*; do
+          [ -L "$_l" ] && [ "$($_bb readlink "$_l" 2>/dev/null)" = "$_bb" ] && rm -f "$_l" 2>/dev/null || true
+        done
+        $_bb --install -s /cache/bin 2>/dev/null || true
         ln -sf /cache/bin/busybox /data/harmony/bin/busybox 2>/dev/null || true
       fi
 
@@ -522,19 +669,28 @@ do_apply() {
   if [ "$OTA_BUNDLE_OK" != "1" ]; then
     echo "[*] Falling back to modular asset download..."
     FB_FILES=""
-    if download_retry "${REPO}/www.tar.gz?_=${TIMESTAMP}" "$TMPDIR/www.tar.gz" 30 3; then
+    if download_retry "${REPO}/www.tar.gz?_=${TIMESTAMP}" "$TMPDIR/www.tar.gz" 30 3 signed; then
       FB_FILES="$FB_FILES www.tar.gz=$TMPDIR/www.tar.gz"
     fi
     FB_BINS=""
     FB_MISSING=""
-    for b in hub_util hub_daemon hub_rf hub_btstack register_ehci eth_fix hub_sync; do
-      if download_retry "${REPO}/bin/mips/${b}?_=${TIMESTAMP}" "$TMPDIR/$b" 30 3; then
+    for b in hub_util hub_daemon hub_fetch hub_rf hub_btstack register_ehci eth_fix hub_sync; do
+      if download_retry "${REPO}/bin/mips/${b}?_=${TIMESTAMP}" "$TMPDIR/$b" 30 3 signed; then
         FB_FILES="$FB_FILES bin/mips/$b=$TMPDIR/$b"
         FB_BINS="$FB_BINS $b"
       elif grep -q "\"bin/mips/$b\"" "$TMPDIR/manifest.json" 2>/dev/null; then
         FB_MISSING="$FB_MISSING $b"
       fi
     done
+    FB_LIB=""
+    if grep -q '"lib/libbearssl.so.0"' "$TMPDIR/manifest.json" 2>/dev/null; then
+      if download_retry "${REPO}/lib/libbearssl.so.0?_=${TIMESTAMP}" "$TMPDIR/libbearssl.so.0" 30 3 signed; then
+        FB_FILES="$FB_FILES lib/libbearssl.so.0=$TMPDIR/libbearssl.so.0"
+        FB_LIB=1
+      else
+        FB_MISSING="$FB_MISSING libbearssl.so.0"
+      fi
+    fi
     # Every downloaded file must match the signed manifest before any of them is installed
     # shellcheck disable=SC2086
     if [ -z "$FB_FILES" ] || ! verify_files $FB_FILES; then
@@ -560,6 +716,14 @@ do_apply() {
         return 1
       fi
     done
+    if [ -n "$FB_LIB" ]; then
+      mkdir -p "$HUB_LIB" 2>/dev/null
+      if ! install_file "$TMPDIR/libbearssl.so.0" "$HUB_LIB/libbearssl.so.0" 755; then
+        rm -rf "$TMPDIR" 2>/dev/null
+        echo "[-] Software update stopped: a file could not be written to flash. Every file is whole, but some are new and some old. Version not changed: free space and run the update again."
+        return 1
+      fi
+    fi
     INSTALL_OK=1
     for b in $FB_BINS; do
       rm -f "/cache/bin/$b" 2>/dev/null || true
@@ -648,10 +812,10 @@ do_fetch_remote_ota() {
 
   # The image is kept only together with its manifest and signature: hub_rf verifies them before
   # it sends anything to the remote, and treats an image without a manifest as staged by hand.
-  if download_retry "${REPO}/manifest.json?_=${TIMESTAMP}" "${manifest}" 10 1 &&
-     download_retry "${REPO}/manifest.json.sig?_=${TIMESTAMP}" "${sig}" 10 1; then
-    if download_retry "${REPO}/bin/arm/remote_ui.ota.gz?_=${TIMESTAMP}" "${target}" 20 1 ||
-       download_retry "${REPO}/bin/arm/elite_ui.ota.gz?_=${TIMESTAMP}" "${target}" 20 1; then
+  if download_retry "${REPO}/manifest.json?_=${TIMESTAMP}" "${manifest}" 10 1 signed &&
+     download_retry "${REPO}/manifest.json.sig?_=${TIMESTAMP}" "${sig}" 10 1 signed; then
+    if download_retry "${REPO}/bin/arm/remote_ui.ota.gz?_=${TIMESTAMP}" "${target}" 20 1 signed ||
+       download_retry "${REPO}/bin/arm/elite_ui.ota.gz?_=${TIMESTAMP}" "${target}" 20 1 signed; then
       echo "[+] Remote OTA package downloaded to ${target}."
       return 0
     fi
@@ -700,6 +864,64 @@ do_remote_ota() {
   fi
 }
 
+# repair-tls: hub_fetch and libbearssl.so.0 of the installed release, when missing. The update.sh of
+# v2.5.3 and older installs neither (its file list predates them) and keeps running from its old
+# file during the update that brings this one, so such a Hub has neither until it is repaired
+# here: init.sh runs this at start when either is missing. Only files of the installed version
+# are taken (a newer release brings them with its own update), checked like an update: the
+# signature of the manifest, then the SHA-256 of each file against it.
+do_repair_tls() {
+  _want=""
+  [ -x "$HUB_FETCH" ] && [ -s "$HUB_FETCH" ] || _want="$_want bin/mips/hub_fetch"
+  [ -s "$HUB_LIB/libbearssl.so.0" ] || _want="$_want lib/libbearssl.so.0"
+  [ -n "$_want" ] || return 0
+  LOCAL_VER=$(get_local_version)
+  TMPDIR=/tmp/ota_repair
+  rm -rf "$TMPDIR" 2>/dev/null
+  mkdir -p "$TMPDIR" || return 1
+  _man_ver=$(fetch_signed_manifest "$TMPDIR") || { rm -rf "$TMPDIR"; return 1; }
+  if [ "${_man_ver#v}" != "${LOCAL_VER#v}" ]; then
+    echo "[*] TLS files missing, but ${REPO} holds v${_man_ver#v} (this Hub: v${LOCAL_VER#v}): the update to it installs them."
+    rm -rf "$TMPDIR"
+    return 0
+  fi
+  _files=""
+  for _f in $_want; do
+    if ! grep -q "\"$_f\"" "$TMPDIR/manifest.json" 2>/dev/null; then
+      echo "[-] $_f is not in the signed manifest of v${LOCAL_VER#v}: cannot repair it."
+      continue
+    fi
+    download_retry "${REPO}/${_f}?_=${TIMESTAMP}" "$TMPDIR/${_f##*/}" 20 3 signed && _files="$_files $_f=$TMPDIR/${_f##*/}"
+  done
+  # shellcheck disable=SC2086
+  if [ -z "$_files" ] || ! verify_files $_files; then
+    echo "[-] TLS files not downloaded or not matching the signed manifest: nothing installed."
+    rm -rf "$TMPDIR"
+    return 1
+  fi
+  mkdir -p /data/harmony/bin "$HUB_LIB" 2>/dev/null
+  _rc=0
+  for _kv in $_files; do
+    _f="${_kv%%=*}"
+    case "$_f" in
+      lib/*) _dst="$HUB_LIB/${_f##*/}" ;;
+      *) _dst="/data/harmony/bin/${_f##*/}" ;;
+    esac
+    if install_file "${_kv#*=}" "$_dst" 755; then
+      echo "[+] Installed $_dst (v${LOCAL_VER#v})."
+    else
+      _rc=1
+    fi
+  done
+  rm -rf "$TMPDIR"
+  # done only when both are there: hub_fetch without the library does no TLS either
+  if [ ! -x "$HUB_FETCH" ] || [ ! -s "$HUB_LIB/libbearssl.so.0" ]; then
+    echo "[-] TLS files still missing after the repair: tried again later."
+    _rc=1
+  fi
+  return $_rc
+}
+
 # One apply at a time: every run uses /tmp/ota_update and its exit removes it, so a second
 # run (a double click, two browser tabs) deleted the files the first was installing. The lock
 # is a directory with the owner's pid and start time; one left by a run that was killed is taken
@@ -710,6 +932,13 @@ proc_start() {
   sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}'
 }
 apply_lock_owner_runs() {
+  # A lock without its pid file belongs to a run between its mkdir and its first write: wait for
+  # the file (3 s) before taking the lock over, or both runs would hold it
+  _w=0
+  while [ ! -s "$APPLY_LOCK/pid" ] && [ -d "$APPLY_LOCK" ] && [ $_w -lt 3 ]; do
+    sleep 1
+    _w=$((_w + 1))
+  done
   _owner=$(cat "$APPLY_LOCK/pid" 2>/dev/null)
   _start=$(cat "$APPLY_LOCK/start" 2>/dev/null)
   [ -n "$_owner" ] && [ -d "/proc/$_owner" ] || return 1
@@ -758,6 +987,27 @@ case "$CMD" in
     ;;
   fetch-remote|fetch-remote-ota)
     do_fetch_remote_ota
+    ;;
+  repair-tls)
+    # not while an update runs (it installs these files itself); a lock left by a killed run is
+    # taken over as apply_locked does
+    if ! mkdir "$APPLY_LOCK" 2>/dev/null; then
+      if apply_lock_owner_runs; then
+        echo "[-] A software update is running: TLS files not repaired now."
+        exit 1
+      fi
+      rm -rf "$APPLY_LOCK" 2>/dev/null
+      if ! mkdir "$APPLY_LOCK" 2>/dev/null; then
+        echo "[-] A software update is starting: TLS files not repaired now."
+        exit 1
+      fi
+    fi
+    echo "$$" > "$APPLY_LOCK/pid"
+    proc_start $$ > "$APPLY_LOCK/start"
+    do_repair_tls
+    _rc=$?
+    rm -rf "$APPLY_LOCK" 2>/dev/null
+    exit $_rc
     ;;
   elite|remote)
     do_remote_ota "$SLOT_ARG"

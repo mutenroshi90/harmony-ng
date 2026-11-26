@@ -16,7 +16,7 @@
 
 /* Durations: positive = mark (carrier on), negative = space */
 typedef struct {
-    int header[2];
+    int header[11];
     int bits;
     int zero[2]; /* atoms for a 0 bit */
     int one[2];  /* atoms for a 1 bit */
@@ -35,6 +35,8 @@ static const segment_t TOSHIBA = { { 8990, -4490 }, 32, { 568, -552 }, { 568, -1
 static const segment_t TOSHIBA_REPEAT = { { 8990, -2230 }, 0, { 0 }, { 0 }, { 568, -96077 }, 0 };
 static const segment_t CAMBRIDGE_REPEAT = { { 9025, -2283 }, 0, { 0 }, { 0 }, { 525, -95419 }, 0 };
 static const segment_t SAITEK = { { 1874, -520 }, 11, { -525, 0 }, { 460, 0 }, { -809, 0 }, 0 };
+static const segment_t SKY = { { 2650, -910, 430, -460, 430, -460, 430, -890, 430, -890, 875 }, 28,
+                               { 430, -460 }, { -460, 430 }, { 0 }, 150500 };
 
 typedef struct {
     int d[256];
@@ -59,7 +61,7 @@ static void wave_add(wave_t *w, int d) {
 
 static void wave_add_segment(wave_t *w, const segment_t *s, int bits, unsigned long value) {
     int start = wave_sum(w);
-    for (int i = 0; i < 2; i++) wave_add(w, s->header[i]);
+    for (int i = 0; i < (int)(sizeof(s->header) / sizeof(s->header[0])); i++) wave_add(w, s->header[i]);
     for (int b = bits - 1; b >= 0; b--) {
         const int *atoms = ((value >> b) & 1) ? s->one : s->zero;
         wave_add(w, atoms[0]);
@@ -116,7 +118,26 @@ static void check_frames(const char *keycode, uint32_t carrier_hz, const segment
     check(keycode, carrier_hz, &w, NULL);
 }
 
-/* A press sends `frames` frames; while the key is held one frame repeats */
+/* One frame of `value`, encoded with the RC5 toggle bit the caller gives */
+static void check_toggle(const char *keycode, uint32_t carrier_hz, const segment_t *s, int bits,
+                         int rc5_toggle, unsigned long value) {
+    wave_t want = { { 0 }, 0 };
+    wave_add_segment(&want, s, bits, value);
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    assert(ir_encode_harmony_keycode_toggle(keycode, 0, rc5_toggle, &buf, &len) == 0);
+    assert((((uint32_t)buf[1] << 24) | ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 8) | buf[4]) == 1000000000u / carrier_hz);
+    wave_t got_start = decode_sequence(buf, 10);
+    wave_t got_repeat = decode_sequence(buf, 12);
+    expect_wave(keycode, &got_start, &want);
+    expect_wave(keycode, &got_repeat, &want);
+    printf("ok %s toggle %d\n", keycode, rc5_toggle);
+    ir_free_encoded(buf);
+}
+
+/* A press sends `frames` frames; while the key is held one frame repeats (no code here uses it
+ * since Sony became one frame; kept for codes that build their start that way) */
+__attribute__((unused))
 static void check_frames_repeat_one(const char *keycode, uint32_t carrier_hz, const segment_t *s, int bits,
                                     unsigned long value, int frames) {
     wave_t w = { { 0 }, 0 }, one = { { 0 }, 0 };
@@ -132,20 +153,98 @@ static void check_rc5ex(const char *keycode, unsigned long address, unsigned lon
     check(keycode, 36000, &w, NULL);
 }
 
+/* Repeat parts a press of keycode sends after its start part, for the device count n */
+static int press_parts(const char *keycode, int n) {
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    assert(ir_encode_harmony_keycode(keycode, 0, &buf, &len) == 0);
+    int parts = ir_press_repeat_parts(keycode, buf, len, n);
+    ir_free_encoded(buf);
+    return parts;
+}
+
+static void expect_parts(const char *keycode, int n, int want) {
+    int got = press_parts(keycode, n);
+    if (got != want) {
+        printf("FAIL press of %s with pressMinRepeats %d: %d repeat part(s), want %d\n", keycode, n, got, want);
+        exit(1);
+    }
+    printf("ok press of %s with pressMinRepeats %d: start + %d\n", keycode, n, got);
+}
+
+/* Frames per press, as a stock Hub sends them (irmanager.lua generateFromKeyCode, hal) */
+static void press_parts_checks(void) {
+    /* empty start group: the frame is the repeat part, a press sends it max(N, 1) times */
+    const char *tv = "G:GoVideoO1 32 Bit:()(0x0707FD02)():3";
+    expect_parts(tv, 1, 0);
+    expect_parts(tv, 0, 0);
+    expect_parts(tv, -1, 2);   /* not set: 3, like stock for an account without the value */
+    expect_parts(tv, 3, 2);
+    expect_parts(tv, 20, 19);
+    expect_parts(tv, 50, 19);  /* at most 20 */
+    expect_parts("G:Samsung 16 and 20 Bit:()(0x0CF0_1x00EF1)():3", 0, 0);
+    /* a start and a separate repeat sequence: the frame, then N repeat codes */
+    const char *xbox = "G:Toshiba 32 Bit:(0x011B946B)(Repeat)():3";
+    expect_parts(xbox, 1, 1);
+    expect_parts(xbox, 0, 0);
+    expect_parts(xbox, -1, 3);
+    expect_parts("G:Cambridge 32 Bit Dual:(0x881E057F_0x881E5F7F)(Repeat)():3", 2, 2);
+    /* Sony: at least 3 frames per press, the keycode's ":5" does not count */
+    expect_parts("G:Sony 12 Bit:()(0x481)():5", 1, 2);
+    expect_parts("G:Sony 12 Bit:()(0x481)():5", 0, 2);
+    expect_parts("G:Sony 12 Bit:()(0x481)():5", 5, 4);
+    /* a learned code goes out once whatever the count */
+    expect_parts("F9470P2328S1194P230S230P230S668", 3, 0);
+    expect_parts("F9470P2328S1194P230S230P230S668", 20, 0);
+    /* Pronto: a repeat sequence only counts as an empty start group; once + repeat as a start
+     * and a repeat sequence */
+    const char *pronto_rep = "0000 006D 0000 0002 0157 0056 0016 0E6C";
+    expect_parts(pronto_rep, 3, 2);
+    expect_parts(pronto_rep, 1, 0);
+    const char *pronto_both = "0000 006D 0002 0002 0157 00AB 0016 0E6C 0157 0056 0016 0E6C";
+    expect_parts(pronto_both, 1, 1);
+    expect_parts(pronto_both, 0, 0);
+    /* timings given as they are (no keycode): once */
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    uint32_t raw[4] = { 9000, 4500, 560, 40000 };
+    assert(ir_encode_raw(38000, raw, 4, 1, &buf, &len) == 0);
+    assert(ir_press_repeat_parts(NULL, buf, len, 3) == 0);
+    ir_free_encoded(buf);
+}
+
 int main(void) {
     /* Marantz receiver: address 16, command 13 (Mute) / 16 (Volume up) / 80 (S2 = 0) */
     check_frames("G:Philips RC5 13 Bit Toggle:()(0x140D)():3", 36000, &RC5, 13, 0x140D, 1);
     check_frames("G:Philips RC5 13 Bit Toggle:()(0x1410)():3", 36000, &RC5, 13, 0x1410, 1);
     check_frames("G:Philips RC5 13 Bit Toggle:()(0x0450)():3", 36000, &RC5, 13, 0x0450, 1);
+    /* The toggle bit (bit 11 of the 13) of a "Toggle" code is flipped when the caller says so
+     * (hw_action.c keeps it per device and protocol); a code without one is sent as stored */
+    check_toggle("G:Philips RC5 13 Bit Toggle:()(0x043B)():3", 36000, &RC5, 13, 0, 0x043B);
+    check_toggle("G:Philips RC5 13 Bit Toggle:()(0x043B)():3", 36000, &RC5, 13, 1, 0x043B ^ 0x0800);
+    check_toggle("G:Philips RC5 13 Bit Toggle:()(0x0C3B)():3", 36000, &RC5, 13, 1, 0x043B);
+    check_toggle("G:Philips RC5 13 Bit:()(0x043B)():3", 36000, &RC5, 13, 1, 0x043B);
+    assert(ir_keycode_is_rc5_toggle("G:Philips RC5 13 Bit Toggle:()(0x043B)():3") == 1);
+    assert(ir_keycode_is_rc5_toggle("G:Philips RC5 13 Bit:()(0x043B)():3") == 0);
+    assert(ir_keycode_is_rc5_toggle("G:NEC1:()(0x20DF10EF)():3") == 0);
+    assert(ir_keycode_is_rc5_toggle("0000 006d 0022 0002") == 0 && ir_keycode_is_rc5_toggle(NULL) == 0);
+
+    /* Sky Q Mini: Home, PowerToggle and the digit 0 */
+    check_frames("G:Sky 28 Bit:()(0xFF7E533)():3", 36000, &SKY, 28, 0xFF7E533, 1);
+    check_frames("G:Sky 28 Bit:()(0xFF7E5F3)():3", 36000, &SKY, 28, 0xFF7E5F3, 1);
+    check_frames("G:Sky 28 Bit:()(0xFF7E5FF)():3", 36000, &SKY, 28, 0xFF7E5FF, 1);
 
     /* Marantz receiver PowerOn (address 16, command 12, data 1) and Back (field bit 0) */
     check_rc5ex("G:Philips RC5Ex:()(0x50_1x301)():3", 0x50, 0x301);
     check_rc5ex("G:Philips RC5Ex:()(0x10_1x5C4)():3", 0x10, 0x5C4);
 
-    /* Sony projector: the 15-bit code has a leading 0 hex bit that must not be sent,
-     * and receivers need the frame repeated (the keycode asks for 3) */
-    check_frames_repeat_one("G:Sony 15 Bit:()(0x7C2A)():3", 40000, &SONY, 15, 0x7C2A, 3);
-    check_frames_repeat_one("G:Sony 20 Bit:()(0xDCB54)():3", 40000, &SONY, 20, 0xDCB54, 3);
+    /* Sony projector: the 15-bit code has a leading 0 hex bit that must not be sent. One
+     * frame is the start and the repeat sequence; a press repeats it (press_parts() below) */
+    check_frames("G:Sony 15 Bit:()(0x7C2A)():3", 40000, &SONY, 15, 0x7C2A, 1);
+    check_frames("G:Sony 20 Bit:()(0xDCB54)():3", 40000, &SONY, 20, 0xDCB54, 1);
+    check_frames("G:Sony 12 Bit:()(0x481)():5", 40000, &SONY, 12, 0x481, 1);
+
+    press_parts_checks();
 
     /* Apple TV: two frames once per press, then the repeat code */
     wave_t start = { { 0 }, 0 }, repeat = { { 0 }, 0 };

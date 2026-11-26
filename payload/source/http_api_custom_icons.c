@@ -3,6 +3,7 @@
 #include "http_server.h"
 #include "http_util.h"
 #include "cJSON.h"
+#include "icon_pack.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,6 +13,7 @@
 #include <pthread.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/sysinfo.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 
@@ -85,49 +87,131 @@ static int custom_icon_name_ok(const char *fn) {
     return 1;
 }
 
+/* An extraction runs: set by the one HTTP worker that wins the compare-and-swap, cleared by the
+ * extraction thread when it ends */
 static volatile int g_icons_extracting = 0;
+/* The copy in /tmp was removed since the pack became readable; cleared when an extraction starts,
+ * so a copy made while the pack was not readable goes once it is again. Several HTTP workers
+ * test and set it: atomic, so only one of them removes the copy */
+static int s_tmp_copy_removed;
 
 static void *extract_icons_thread(void *arg) {
-    const char *tar_path = (const char *)arg;
-    mkdir("/tmp/www", 0755);
-    mkdir("/tmp/www/assets", 0755);
+    char *tar_path = (char *)arg; /* the starting worker's copy, freed here */
+    printf("[+] Unpacking icon archive %s into " HARMONY_TMP_WWW "\n", tar_path);
+    fflush(stdout);
+    mkdir(HARMONY_TMP_WWW, 0755);
+    mkdir(HARMONY_TMP_WWW "/assets", 0755);
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
         "export PATH=/cache/bin:/data/harmony/bin:$PATH; "
-        "tar -xzf \"%s\" -C /tmp/www/assets/ 2>/dev/null && "
-        "for d in /tmp/www/assets/icons/*/; do "
+        "tar -xzf \"%s\" -C " HARMONY_TMP_WWW "/assets/ 2>/dev/null && "
+        "for d in " HARMONY_TMP_WWW "/assets/icons/*/; do "
         "  if [ -d \"$d\" ]; then "
-        "    for f in \"$d\"*.png; do [ -f \"$f\" ] && ln -sf \"$f\" /tmp/www/assets/icons/ 2>/dev/null; done; "
+        "    for f in \"$d\"*.png; do [ -f \"$f\" ] && ln -sf \"$f\" " HARMONY_TMP_WWW "/assets/icons/ 2>/dev/null; done; "
         "  fi; "
         "done",
         tar_path);
     system(cmd);
-    g_icons_extracting = 0;
+    free(tar_path);
+    __sync_lock_release(&g_icons_extracting);
     return NULL;
 }
 
+/* Free RAM left after unpacking a pack of another version into /tmp, for the daemons */
+#define ICON_UNPACK_RESERVE_KB 8192UL
+
+static unsigned long free_ram_kb(void) {
+#ifdef TEST_HARNESS
+    const char *t = getenv("HARMONY_TEST_FREE_RAM_KB");
+    if (t && *t) return strtoul(t, NULL, 10);
+#endif
+    struct sysinfo si;
+    if (sysinfo(&si) != 0) return 0;
+    unsigned long long b = ((unsigned long long)si.freeram + si.bufferram) * (si.mem_unit ? si.mem_unit : 1);
+    return (unsigned long)(b / 1024);
+}
+
+/* A pack of another version (after a downgrade to a firmware that reads an older pack version;
+ * an OTA package carries no icon archive, so the newer one stays) is a valid tar.gz: it is
+ * unpacked into /tmp as a plain archive when the RAM allows it, as before the pack existed.
+ * Needed: three times the file (the stock icons: 1.6 MB packed, 4.3 MB in RAM pages) plus a
+ * reserve. Free = MemFree + Buffers (2.6.31 has no MemAvailable, and Cached holds tmpfs pages),
+ * read at every call until it fits. One log line per file and outcome. */
+static int other_pack_fits_in_ram(const char *path, const struct stat *st, int ver) {
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static struct stat logged;
+    static int logged_fit = -1;
+    unsigned long need = (unsigned long)(st->st_size / 1024) * 3 + ICON_UNPACK_RESERVE_KB;
+    unsigned long have = free_ram_kb();
+    int fit = have >= need;
+    pthread_mutex_lock(&lock);
+    int same = logged_fit == fit && logged.st_ino == st->st_ino && logged.st_dev == st->st_dev &&
+               logged.st_size == st->st_size && logged.st_mtime == st->st_mtime;
+    if (!same) {
+        logged = *st;
+        logged_fit = fit;
+        if (fit) {
+            printf("[!] Icon pack %s: pack version %d, this firmware reads version %d: unpacked into /tmp "
+                   "as a plain archive (%lu KB free RAM)\n", path, ver, ICON_PACK_VERSION, have);
+        } else {
+            printf("[!] Icon pack %s: pack version %d, this firmware reads version %d: not unpacked into "
+                   "/tmp (needs %lu KB free RAM, %lu KB free): no stock icons until a matching archive "
+                   "is deployed\n", path, ver, ICON_PACK_VERSION, need, have);
+        }
+        fflush(stdout);
+    }
+    pthread_mutex_unlock(&lock);
+    return fit;
+}
+
 void http_ensure_icons_extracted(void) {
-    if (access("/tmp/www/assets/icons", F_OK) == 0) return;
+    if (icon_pack_available()) {
+        /* Icons are read from the packed archive on flash. A copy unpacked into /tmp (RAM) by
+         * this or an older firmware before the packed archive was deployed is removed once;
+         * uploaded icons there are copies of /data/harmony/custom_icons, which is served too. */
+        if (!g_icons_extracting && !__sync_lock_test_and_set(&s_tmp_copy_removed, 1)) {
+            if (access(HARMONY_TMP_WWW "/assets/icons", F_OK) == 0) {
+                system("rm -rf " HARMONY_TMP_WWW "/assets/icons");
+                printf("[+] Unpacked icon copy in /tmp removed: icons are read from the packed archive\n");
+            }
+        }
+        return;
+    }
+    if (access(HARMONY_TMP_WWW "/assets/icons", F_OK) == 0) return;
     if (g_icons_extracting) return;
 
-    static char s_tar_path[128];
-    s_tar_path[0] = '\0';
-    if (access("/data/harmony/icons.tar.gz", F_OK) == 0) {
-        strncpy(s_tar_path, "/data/harmony/icons.tar.gz", sizeof(s_tar_path) - 1);
-    } else if (access("/cache/icons.tar.gz", F_OK) == 0) {
-        strncpy(s_tar_path, "/cache/icons.tar.gz", sizeof(s_tar_path) - 1);
-    } else if (access("/cache/www/assets/icons.tar.gz", F_OK) == 0) {
-        strncpy(s_tar_path, "/cache/www/assets/icons.tar.gz", sizeof(s_tar_path) - 1);
+    char path[256];
+    int ver = -1;
+    struct stat st;
+    /* the file icon_pack looks at, so a pack it cannot read is the one judged here */
+    int kind = icon_pack_archive(path, sizeof(path), &st, &ver);
+    if (kind == ICON_ARCHIVE_NONE) return;
+    /* a packed archive whose index is not readable right now (being copied, cut): unpacking it
+     * into /tmp cannot help, it is read from flash once it is whole again */
+    if (kind == ICON_ARCHIVE_PACK) return;
+    if (kind == ICON_ARCHIVE_PACK_OTHER && !other_pack_fits_in_ram(path, &st, ver)) return;
+#ifdef TEST_HARNESS
+    /* widens the window between the checks above and the claim, so the route test can see two
+     * workers in it */
+    const char *d = getenv("HARMONY_TEST_EXTRACT_DELAY_MS");
+    if (d && *d) usleep((useconds_t)strtoul(d, NULL, 10) * 1000);
+#endif
+    /* several HTTP workers get here at once: only the one that sets the flag starts the
+     * extraction, and it looks again whether one finished in the meantime */
+    if (!__sync_bool_compare_and_swap(&g_icons_extracting, 0, 1)) return;
+    char *arg = strdup(path);
+    if (!arg || access(HARMONY_TMP_WWW "/assets/icons", F_OK) == 0) {
+        free(arg);
+        __sync_lock_release(&g_icons_extracting);
+        return;
     }
-
-    if (s_tar_path[0]) {
-        g_icons_extracting = 1;
-        pthread_t th;
-        if (pthread_create(&th, NULL, extract_icons_thread, (void *)s_tar_path) == 0) {
-            pthread_detach(th);
-        } else {
-            g_icons_extracting = 0;
-        }
+    __sync_lock_release(&s_tmp_copy_removed);
+    pthread_t th;
+    if (pthread_create(&th, NULL, extract_icons_thread, arg) == 0) {
+        pthread_detach(th);
+    } else {
+        free(arg);
+        __sync_lock_release(&g_icons_extracting);
     }
 }
 
@@ -139,6 +223,13 @@ void http_ensure_icons_extracted(void) {
 #define PROXY_FETCH_MAX_MS 20000 /* the whole download */
 #endif
 
+static void add_icon_name(const char *name, void *ctx) {
+    size_t n = strlen(name);
+    if (name[0] != '.' && n > 4 && strcmp(name + n - 4, ".png") == 0) {
+        cJSON_AddItemToArray((cJSON *)ctx, cJSON_CreateString(name));
+    }
+}
+
 int http_api_custom_icons_handle(int client_fd, const char *method, const char *clean_path,
                                  const char *query, const char *body, const char *req) {
     (void)req;
@@ -147,14 +238,17 @@ int http_api_custom_icons_handle(int client_fd, const char *method, const char *
     if (strcmp(clean_path, "/api/icons") == 0 && strcmp(method, "GET") == 0) {
         http_ensure_icons_extracted();
         cJSON *arr = cJSON_CreateArray();
-        const char *base_dir = "/tmp/www/assets/icons";
+        int packed = icon_pack_available();
+        if (packed) icon_pack_list(add_icon_name, arr);
+        const char *base_dir = HARMONY_TMP_WWW "/assets/icons";
         if (access(base_dir, F_OK) != 0) {
             base_dir = "/cache/www/assets/icons";
             if (access(base_dir, F_OK) != 0) {
                 base_dir = "/data/harmony/www/assets/icons";
             }
         }
-        DIR *d = opendir(base_dir);
+        /* packed: the folders hold only copies of the uploaded icons, listed below */
+        DIR *d = packed ? NULL : opendir(base_dir);
         if (d) {
             struct dirent *de;
             while ((de = readdir(d)) != NULL) {
@@ -320,7 +414,7 @@ int http_api_custom_icons_handle(int client_fd, const char *method, const char *
 
         mkdir("/data/harmony", 0755);
         mkdir("/data/harmony/custom_icons", 0755);
-        mkdir("/tmp/www/assets/icons", 0755);
+        mkdir(HARMONY_TMP_WWW "/assets/icons", 0755);
         mkdir("/cache/www/assets/icons", 0755);
 
         char main_name[64];
@@ -344,7 +438,7 @@ int http_api_custom_icons_handle(int client_fd, const char *method, const char *
         char p_data[256], p_cache[256], p_tmp[256];
         snprintf(p_data, sizeof(p_data), "/data/harmony/custom_icons/%s", main_name);
         snprintf(p_cache, sizeof(p_cache), "/cache/www/assets/icons/%s", main_name);
-        snprintf(p_tmp, sizeof(p_tmp), "/tmp/www/assets/icons/%s", main_name);
+        snprintf(p_tmp, sizeof(p_tmp), HARMONY_TMP_WWW "/assets/icons/%s", main_name);
 
         if (write_file_atomic_sized(p_data, (const char *)png_data, png_len) != 0) {
             send_json_error(client_fd, 500, "Failed to write custom icon to flash storage");
@@ -418,7 +512,7 @@ int http_api_custom_icons_handle(int client_fd, const char *method, const char *
         if (unlink(path_buf) == 0) {
             snprintf(path_buf, sizeof(path_buf), "/cache/www/assets/icons/%s", fn);
             unlink(path_buf);
-            snprintf(path_buf, sizeof(path_buf), "/tmp/www/assets/icons/%s", fn);
+            snprintf(path_buf, sizeof(path_buf), HARMONY_TMP_WWW "/assets/icons/%s", fn);
             unlink(path_buf);
         }
 
@@ -494,9 +588,9 @@ int http_api_custom_icons_handle(int client_fd, const char *method, const char *
             return 1;
         }
         close(tmp_fd);
-        int fetched = -1;
+        int fetched = fetch_url_checked(decoded_url, tmp_path, PROXY_FETCH_MAX_BYTES, PROXY_FETCH_MAX_MS, 6);
         static const char *const wget_paths[] = { "/cache/bin/busybox", "/data/harmony/bin/busybox" };
-        for (size_t wi = 0; wi < sizeof(wget_paths) / sizeof(wget_paths[0]); wi++) {
+        for (size_t wi = 0; fetched == RUN_NO_FETCH && wi < sizeof(wget_paths) / sizeof(wget_paths[0]); wi++) {
             char *argv[] = { (char *)wget_paths[wi], "wget", "-q", "--no-check-certificate", "-T", "6",
                              "-O", tmp_path, decoded_url, NULL };
             if (access(wget_paths[wi], X_OK) != 0) continue;

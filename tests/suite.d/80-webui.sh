@@ -11,6 +11,9 @@ echo "[-] Running web UI tests..."
 webui_node_test test_frontend_auth.mjs
 webui_node_test test_frontend_connection.mjs
 webui_node_test test_webui_keymap_load.mjs
+webui_node_test test_webui_command_port.mjs
+# RF remote page: auto-map wiring and aliases, no device scope for a remote without a screen
+webui_node_test test_webui_remote_slots.mjs
 webui_node_test test_frontend_b25.mjs
 webui_node_test test_webui_dead_routes.mjs
 # Every Hub path the two UIs call has a handler in payload/source
@@ -25,3 +28,5 @@ webui_node_test test_webui_usb_wifi_toggle.mjs
 webui_node_test test_webui_hub_update_state.mjs
 # The update banner button starts the Hub update
 webui_node_test test_webui_update_banner.mjs
+# Plugin devices: boolean config fields are checkboxes, default commands keep irKeyCode / irWhen
+webui_node_test test_webui_plugin_fields.mjs
